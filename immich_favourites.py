@@ -244,6 +244,8 @@ def main():
     ap.add_argument("--url", default=os.environ.get("IMMICH_URL", "http://localhost:2283/api"),
                     help="Immich API base URL (ends in /api)")
     ap.add_argument("--api-key", default=os.environ.get("IMMICH_API_KEY"))
+    ap.add_argument("--web-url", help="Immich web UI base URL for links in the log "
+                    "(default: --url without the trailing /api)")
     ap.add_argument("--source", default="/srv/http/192.168.1.4/resized/")
     ap.add_argument("--search-root", action="append", metavar="HOST=CONTAINER",
                     help="host dir to search and its path inside the immich container; repeatable. "
@@ -268,6 +270,7 @@ def main():
     if args.search_root:
         maps = [tuple(x.split("=", 1)) for x in args.search_root]
 
+    web_url = (args.web_url or args.url.rstrip("/").removesuffix("/api")).rstrip("/")
     mode = "apply" if args.apply else "dryrun"
     state_path = args.state or f"favourites-{mode}.jsonl"
     logf = open(f"favourites-{mode}.log", "a")
@@ -324,6 +327,9 @@ def main():
             state.flush()
             if status in ("ambiguous", "not_found", "not_in_immich", "no_exif", "error"):
                 log(f"[{i}/{total}] {status.upper()} {fn} {detail.get('note', detail.get('error', ''))}", logf)
+                if status == "ambiguous":
+                    for aid in detail.get("assets", []):
+                        log(f"    {web_url}/photos/{aid}", logf)
             else:
                 log(f"[{i}/{total}] {status} {fn} via {detail.get('how')}", logf)
             if n_done % args.stats_every == 0:
