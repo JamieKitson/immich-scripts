@@ -142,6 +142,36 @@ def to_container(path, maps):
     raise ValueError(f"no --map covers {path}")
 
 
+RAW_EXT = {".nef", ".nrw", ".cr2", ".cr3", ".crw", ".arw", ".srf", ".sr2", ".dng", ".raf",
+           ".orf", ".rw2", ".pef", ".raw", ".3fr", ".erf", ".kdc", ".mrw", ".x3f"}
+
+
+def pick_best(assets):
+    """Choose one asset from equivalent versions of the same picture.
+    Prefer jpg over other formats over raw; avoid COVER / _NNNN style names;
+    then shorter path; then alphabetical, so the choice is deterministic."""
+    def score(a):
+        name = a.get("originalFileName") or os.path.basename(a.get("originalPath", ""))
+        ext = os.path.splitext(name)[1].lower()
+        fmt = 0 if ext in (".jpg", ".jpeg") else 2 if ext in RAW_EXT else 1
+        stem = os.path.splitext(name)[0]
+        marked = 1 if ("cover" in stem.lower() or re.search(r"_\d{4}(?!\d)", stem)) else 0
+        return (fmt, marked, len(a.get("originalPath", "")), a.get("originalPath", ""))
+    return min(assets, key=score)
+
+
+def resolve_tie(found, args, detail, note):
+    """Returns (asset_or_list, None) or (None, ambiguous_result)."""
+    if args.ties == "all":
+        return found, None
+    if args.ties == "pick":
+        best = pick_best(found)
+        detail["picked_from"] = len(found)
+        detail["others"] = [a["id"] for a in found if a["id"] != best["id"]]
+        return best, None
+    return None, ("ambiguous", {**detail, "assets": [a["id"] for a in found], "note": note})
+
+
 def process(src, index, im, maps, args):
     """Return (status, detail dict). Statuses: favourited/would_favourite/already_favourite/
     not_in_immich/not_found/ambiguous/no_exif/error."""
@@ -180,11 +210,10 @@ def process(src, index, im, maps, args):
             if len(found) == 1:
                 asset = found[0]
             elif len(found) > 1:
-                if args.ties == "all":
-                    asset = found
-                else:
-                    return "ambiguous", {**detail, "assets": [a["id"] for a in found],
-                                         "note": f"{len(found)} files share name+date (use --ties all)"}
+                asset, res = resolve_tie(found, args, detail,
+                                         f"{len(found)} files share name+date")
+                if res:
+                    return res
 
     if asset is None and not hits:
         how = "time-search"
@@ -215,11 +244,10 @@ def process(src, index, im, maps, args):
             same_name = [a for a in items if a.get("originalFileName", "").lower() == key.lower()]
             items = same_name or items
         if len(items) > 1:
-            if args.ties == "all":
-                asset = items
-            else:
-                return "ambiguous", {**detail, "assets": [a["id"] for a in items],
-                                     "note": f"{len(items)} immich assets at that time"}
+            asset, res = resolve_tie(items, args, detail,
+                                     f"{len(items)} immich assets at that time")
+            if res:
+                return res
         else:
             asset = items[0]
 
@@ -254,8 +282,9 @@ def main():
     ap.add_argument("--date-window", type=float, default=1.0, help="EXIF time tolerance in seconds")
     ap.add_argument("--max-tz-offset", type=float, default=14.0,
                     help="max camera UTC offset (hours) considered when time-searching")
-    ap.add_argument("--ties", choices=["skip", "all"], default="skip",
-                    help="when several assets match equally: skip (log) or favourite all")
+    ap.add_argument("--ties", choices=["pick", "skip", "all"], default="pick",
+                    help="when several assets match equally: pick one (jpg over raw, avoiding "
+                         "COVER/_NNNN names; default), skip (log as ambiguous), or favourite all")
     ap.add_argument("--ignore-case", action="store_true", help="case-insensitive filename matching")
     ap.add_argument("--state", help="state file (default: favourites-<dryrun|apply>.jsonl)")
     ap.add_argument("--restart", action="store_true", help="ignore existing state and start over")
