@@ -51,8 +51,7 @@ def log(msg, fh=None):
 
 
 def read_exif(path):
-    """Return (taken_utc: datetime|None, (w, h)|None). Naive times are treated as UTC,
-    which is what Immich does when a file has no offset tag."""
+    """Return (wall_clock_time: datetime|None [labelled UTC], (w, h)|None)."""
     try:
         with Image.open(path) as im:
             size = im.size
@@ -66,12 +65,7 @@ def read_exif(path):
             frac = str(sub.get(T_SUBSEC_ORIGINAL) or "").strip()
             if frac.isdigit():
                 dt = dt.replace(microsecond=int((frac + "000000")[:6]))
-            off = str(sub.get(T_OFFSET_ORIGINAL) or "").strip()
-            tz = timezone.utc
-            if len(off) == 6 and off[0] in "+-" and off[3] == ":":
-                sign = 1 if off[0] == "+" else -1
-                tz = timezone(sign * timedelta(hours=int(off[1:3]), minutes=int(off[4:6])))
-            return dt.replace(tzinfo=tz).astimezone(timezone.utc), size
+            return dt.replace(tzinfo=timezone.utc), size  # wall-clock time, tz ignored
     except Exception:
         return None, None
 
@@ -121,8 +115,18 @@ class Immich:
                 if a.get("originalPath") == container_path]
 
     def by_time(self, dt, secs):
-        return self.search({"takenAfter": iso(dt - timedelta(seconds=secs)),
-                            "takenBefore": iso(dt + timedelta(seconds=secs))})
+        """All assets whose stored (UTC) time is within +-secs of dt, paged."""
+        body = {"takenAfter": iso(dt - timedelta(seconds=secs)),
+                "takenBefore": iso(dt + timedelta(seconds=secs)),
+                "size": 250, "withExif": True}
+        items, page = [], 1
+        while page <= 20:
+            r = self._req("POST", "/search/metadata", json={**body, "page": page}).json()["assets"]
+            items += r["items"]
+            if not r.get("nextPage"):
+                break
+            page = int(r["nextPage"])
+        return items
 
     def favourite(self, asset_id):
         self._req("PUT", "/assets", json={"ids": [asset_id], "isFavorite": True})
@@ -186,7 +190,20 @@ def process(src, index, im, maps, args):
         how = "time-search"
         if taken is None:
             return "no_exif", {**detail, "note": "no name match and source has no EXIF date"}
-        items = im.by_time(taken, args.date_window)
+        # Compare wall-clock time: Immich's localDateTime is the camera's wall-clock time
+        # (stored as if UTC). The *stored* UTC time differs by the camera's offset, which we
+        # don't know, so fetch a wide window and filter on localDateTime.
+        raw = im.by_time(taken, args.max_tz_offset * 3600 + args.date_window)
+        items = []
+        for a in raw:
+            s_ = a.get("localDateTime")
+            try:
+                t = datetime.fromisoformat(s_.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if close(t, taken, args.date_window):
+                items.append(a)
+        detail["time_candidates"] = len(items)
         def dims(a):
             e = a.get("exifInfo") or {}
             w, h = e.get("exifImageWidth"), e.get("exifImageHeight")
@@ -233,6 +250,8 @@ def main():
                          "Default: /btsync=/external/older, /mnt/sea5t/backup=/external/newer")
     ap.add_argument("--apply", action="store_true", help="actually write to Immich (default: dry run)")
     ap.add_argument("--date-window", type=float, default=1.0, help="EXIF time tolerance in seconds")
+    ap.add_argument("--max-tz-offset", type=float, default=14.0,
+                    help="max camera UTC offset (hours) considered when time-searching")
     ap.add_argument("--ties", choices=["skip", "all"], default="skip",
                     help="when several assets match equally: skip (log) or favourite all")
     ap.add_argument("--ignore-case", action="store_true", help="case-insensitive filename matching")
