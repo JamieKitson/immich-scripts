@@ -20,9 +20,9 @@ Usage:   export IMMICH_API_KEY=xxxx
 import argparse
 import json
 import os
+import re
 import sys
 import time
-import re
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -173,13 +173,95 @@ def resolve_tie(found, args, detail, note):
     return None, ("ambiguous", {**detail, "assets": [a["id"] for a in found], "note": note})
 
 
+# Flickr backup names look like DD-HH-MM-<original name>-<flickr id>.jpg and live in
+# <root>/YYYY-MM/, e.g. 2019-11/05-21-03-IMG-20191105-WA0015-49021479022.jpg
+FLICKR_RE = re.compile(r"^(\d\d)-(\d\d)-(\d\d)-.+-\d+\.[A-Za-z0-9]+$")
+
+
+class FlickrIndex:
+    """name -> [relative dirs] for the flickr backup. Crawled lazily (only when a file
+    without EXIF needs it) and cached on disk because the drive is slow (USB 2)."""
+
+    def __init__(self, root, cache_path, reindex, logf):
+        self.root, self.cache_path, self.reindex, self.logf = root, cache_path, reindex, logf
+        self.files = None
+
+    def _load(self):
+        if not self.reindex and os.path.exists(self.cache_path):
+            try:
+                with open(self.cache_path) as f:
+                    c = json.load(f)
+                if c.get("root") == self.root:
+                    age = (time.time() - c["built"]) / 86400
+                    self.files = c["files"]
+                    log(f"flickr index loaded from {self.cache_path}: {len(self.files)} names, "
+                        f"{age:.1f} days old (--reindex-flickr to rebuild)", self.logf)
+                    return
+            except Exception as e:
+                log(f"flickr cache unreadable ({e}), rebuilding", self.logf)
+        log(f"crawling {self.root} (slow on USB 2, only done once)...", self.logf)
+        t0, n, files = time.time(), 0, defaultdict(list)
+        for dp, _dn, fns in os.walk(self.root, onerror=lambda e: log(f"walk error: {e}", self.logf)):
+            rel = os.path.relpath(dp, self.root)
+            for fn in fns:
+                files[fn].append(rel)
+                n += 1
+                if n % 20000 == 0:
+                    log(f"  ...{n} files, {time.time() - t0:.0f}s", self.logf)
+        self.files = dict(files)
+        tmp = self.cache_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"root": self.root, "built": time.time(), "files": self.files}, f)
+        os.replace(tmp, self.cache_path)
+        log(f"flickr index built: {n} files in {time.time() - t0:.0f}s, cached to {self.cache_path}",
+            self.logf)
+
+    def date_for(self, name):
+        """Return (datetime, win, note, path). Prefers the EXIF date of the backup file itself
+        (exact, window=None); else the date from its dir + name at HH:MM:30 (win=31s)."""
+        m = FLICKR_RE.match(name)
+        if not m:
+            return None, None, "name is not in flickr backup form", None
+        if self.files is None:
+            self._load()
+        dirs = self.files.get(name, [])
+        if not dirs:
+            return None, None, "not found in flickr backup", None
+        if len(dirs) > 1:
+            return None, None, f"found in {len(dirs)} flickr month dirs", None
+        path = os.path.join(self.root, dirs[0], name)
+        t, _ = read_exif(path)
+        if t:
+            return t, None, None, path
+        ym = re.search(r"(\d{4})-(\d\d)", dirs[0])
+        if not ym:
+            return None, None, f"flickr dir {dirs[0]!r} is not YYYY-MM", path
+        try:
+            dt = datetime(int(ym[1]), int(ym[2]), int(m[1]), int(m[2]), int(m[3]), 30,
+                          tzinfo=timezone.utc)
+        except ValueError:
+            return None, None, "invalid date from flickr dir/name", path
+        return dt, 31.0, None, path
+
+
 def process(src, index, im, maps, args):
     """Return (status, detail dict). Statuses: favourited/would_favourite/already_favourite/
     not_in_immich/not_found/ambiguous/no_exif/error."""
     key = os.path.basename(src)
     hits = index.get(key.lower() if args.ignore_case else key, [])
     taken, size = read_exif(src)
+    win = args.date_window
     detail = {"candidates": len(hits)}
+    if taken is None and args.flickr is not None:
+        taken, fwin, fnote, fpath = args.flickr.date_for(key)
+        if taken:
+            if fwin:  # no EXIF in the backup file either: name only gives the minute
+                win = fwin
+                detail["flickr_time"] = taken.strftime("%Y-%m-%d %H:%M") + " (from path)"
+            else:
+                detail["flickr_time"] = taken.strftime("%Y-%m-%d %H:%M:%S") + " (from backup file EXIF)"
+        elif FLICKR_RE.match(key):
+            detail["flickr"] = fnote
     asset = None
     how = None
 
@@ -198,7 +280,7 @@ def process(src, index, im, maps, args):
         good = []
         for h in hits:
             t, _ = read_exif(h)
-            if t and close(t, taken, args.date_window):
+            if t and close(t, taken, win):
                 good.append(h)
         if len(good) == 0:
             detail["note"] = "name matches but none have matching EXIF date, trying time search"
@@ -219,11 +301,11 @@ def process(src, index, im, maps, args):
     if asset is None and not hits:
         how = "time-search"
         if taken is None:
-            return "no_exif", {**detail, "note": "no name match and source has no EXIF date"}
+            return "no_exif", {**detail, "note": "no name match and no usable date (EXIF/flickr: " + str(detail.get("flickr")) + ")"}
         # Compare wall-clock time: Immich's localDateTime is the camera's wall-clock time
         # (stored as if UTC). The *stored* UTC time differs by the camera's offset, which we
         # don't know, so fetch a wide window and filter on localDateTime.
-        raw = im.by_time(taken, args.max_tz_offset * 3600 + args.date_window)
+        raw = im.by_time(taken, args.max_tz_offset * 3600 + win)
         items = []
         for a in raw:
             s_ = a.get("localDateTime")
@@ -231,7 +313,7 @@ def process(src, index, im, maps, args):
                 t = datetime.fromisoformat(s_.replace("Z", "+00:00"))
             except Exception:
                 continue
-            if close(t, taken, args.date_window):
+            if close(t, taken, win):
                 items.append(a)
         detail["time_candidates"] = len(items)
         def dims(a):
@@ -283,6 +365,11 @@ def main():
     ap.add_argument("--date-window", type=float, default=1.0, help="EXIF time tolerance in seconds")
     ap.add_argument("--max-tz-offset", type=float, default=14.0,
                     help="max camera UTC offset (hours) considered when time-searching")
+    ap.add_argument("--flickr-root", default="/mnt/disk/flickrBackup/jamie/",
+                    help="flickr backup dir, used to date EXIF-less files named DD-HH-MM-name-id.jpg "
+                         "(pass '' to disable)")
+    ap.add_argument("--flickr-cache", default="flickr-index.json", help="cache for the flickr crawl")
+    ap.add_argument("--reindex-flickr", action="store_true", help="re-crawl the flickr backup")
     ap.add_argument("--ties", choices=["pick", "skip", "all"], default="pick",
                     help="when several assets match equally: pick one (jpg over raw, avoiding "
                          "COVER/_NNNN names; default), skip (log as ambiguous), or favourite all")
@@ -339,6 +426,8 @@ def main():
     total = len(files)
     log(f"{total} source files, {len(done)} to skip", logf)
 
+    args.flickr = (FlickrIndex(args.flickr_root.rstrip("/") or "/", args.flickr_cache,
+                               args.reindex_flickr, logf) if args.flickr_root else None)
     im = Immich(args.url, args.api_key)
     stats = Counter()
     start, n_done = time.time(), 0
