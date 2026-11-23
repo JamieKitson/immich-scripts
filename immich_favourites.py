@@ -176,6 +176,7 @@ def resolve_tie(found, args, detail, note):
 # Flickr backup names look like DD-HH-MM-<original name>-<flickr id>.jpg and live in
 # <root>/YYYY-MM/, e.g. 2019-11/05-21-03-IMG-20191105-WA0015-49021479022.jpg
 FLICKR_RE = re.compile(r"^(\d\d)-(\d\d)-(\d\d)-.+-\d+\.[A-Za-z0-9]+$")
+FLICKR_NAME_RE = re.compile(r"^\d\d-\d\d-\d\d-(.+)-\d+(\.[A-Za-z0-9]+)$")
 
 
 class FlickrIndex:
@@ -248,20 +249,51 @@ def process(src, index, im, maps, args):
     """Return (status, detail dict). Statuses: favourited/would_favourite/already_favourite/
     not_in_immich/not_found/ambiguous/no_exif/error."""
     key = os.path.basename(src)
-    hits = index.get(key.lower() if args.ignore_case else key, [])
     taken, size = read_exif(src)
     win = args.date_window
-    detail = {"candidates": len(hits)}
-    if taken is None and args.flickr is not None:
-        taken, fwin, fnote, fpath = args.flickr.date_for(key)
-        if taken:
-            if fwin:  # no EXIF in the backup file either: name only gives the minute
-                win = fwin
-                detail["flickr_time"] = taken.strftime("%Y-%m-%d %H:%M") + " (from path)"
+    detail = {}
+
+    def lookup(name):
+        return index.get(name.lower() if args.ignore_case else name, [])
+
+    # Flickr backup names are DD-HH-MM-<original name>-<flickr id>.<ext>. Look for the
+    # original name on disk first; if found, carry on as for any other file.
+    hits = []
+    m = FLICKR_NAME_RE.match(key)
+    if m:
+        text, ext = m.group(1), m.group(2)
+        variants = []
+        # as-is, then Flickr often turns the last "_" into "-" (DSC_3521 -> DSC-3521), then all
+        for t in (text, re.sub(r"-(?=[^-]*$)", "_", text), text.replace("-", "_")):
+            for e in (ext, ext.lower(), ext.upper()):
+                if t + e not in variants:
+                    variants.append(t + e)
+        for v in variants:
+            hits = lookup(v)
+            if hits:
+                detail["flickr_original_name"] = v
+                break
+    if not hits:
+        hits = lookup(key)
+    detail["candidates"] = len(hits)
+
+    def need_date():
+        """Capture time of the source. If it has no EXIF and is a flickr backup name, take it
+        from the backup (crawled lazily, only when actually needed)."""
+        nonlocal taken, win
+        if taken is None and args.flickr is not None and FLICKR_RE.match(key):
+            t, fwin, fnote, _fpath = args.flickr.date_for(key)
+            if t:
+                taken = t
+                if fwin:  # backup file has no EXIF either: name only gives the minute
+                    win = fwin
+                    detail["flickr_time"] = t.strftime("%Y-%m-%d %H:%M") + " (from path)"
+                else:
+                    detail["flickr_time"] = t.strftime("%Y-%m-%d %H:%M:%S") + " (from backup file EXIF)"
             else:
-                detail["flickr_time"] = taken.strftime("%Y-%m-%d %H:%M:%S") + " (from backup file EXIF)"
-        elif FLICKR_RE.match(key):
-            detail["flickr"] = fnote
+                detail["flickr"] = fnote
+        return taken
+
     asset = None
     how = None
 
@@ -275,7 +307,7 @@ def process(src, index, im, maps, args):
             hits = []  # fall through to time search
 
     elif len(hits) > 1:
-        if taken is None:
+        if need_date() is None:
             return "no_exif", {**detail, "note": "multiple name matches but source has no EXIF date"}
         good = []
         for h in hits:
@@ -300,7 +332,7 @@ def process(src, index, im, maps, args):
 
     if asset is None and not hits:
         how = "time-search"
-        if taken is None:
+        if need_date() is None:
             return "no_exif", {**detail, "note": "no name match and no usable date (EXIF/flickr: " + str(detail.get("flickr")) + ")"}
         # Compare wall-clock time: Immich's localDateTime is the camera's wall-clock time
         # (stored as if UTC). The *stored* UTC time differs by the camera's offset, which we
