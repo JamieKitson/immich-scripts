@@ -39,6 +39,9 @@ T_DATETIME = 306
 DEFAULT_MAPS = [
     ("/btsync", "/external/older"),
     ("/mnt/sea5t/backup", "/external/newer"),
+    ("/mnt/sea5t/JamiePixel3a2", "/external/phones/JamiePixel3a2"),
+    ("/mnt/sea5t/JamiePixel7Pro", "/external/phones/JamiePixel7Pro"),
+    ("/mnt/sea5t/JamieSurfaceDuo", "/external/phones/JamieSurfaceDuo"),
 ]
 
 
@@ -392,7 +395,7 @@ def main():
     ap.add_argument("--source", default="/srv/http/192.168.1.4/resized/")
     ap.add_argument("--search-root", action="append", metavar="HOST=CONTAINER",
                     help="host dir to search and its path inside the immich container; repeatable. "
-                         "Default: /btsync=/external/older, /mnt/sea5t/backup=/external/newer")
+                         "Default: the five mounts in DEFAULT_MAPS (older, newer, 3 phone dirs)")
     ap.add_argument("--apply", action="store_true", help="actually write to Immich (default: dry run)")
     ap.add_argument("--date-window", type=float, default=1.0, help="EXIF time tolerance in seconds")
     ap.add_argument("--max-tz-offset", type=float, default=14.0,
