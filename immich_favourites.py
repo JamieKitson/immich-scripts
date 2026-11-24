@@ -303,7 +303,7 @@ def process(src, index, im, maps, args):
         if found:
             asset = found[0]
         else:
-            detail["note"] = "path not in immich, trying time search"
+            detail["note"] = f"found on disk ({hits[0]}) but no immich asset at {to_container(hits[0], maps)}"
             hits = []  # fall through to time search
 
     elif len(hits) > 1:
@@ -333,7 +333,7 @@ def process(src, index, im, maps, args):
     if asset is None and not hits:
         how = "time-search"
         if need_date() is None:
-            return "no_exif", {**detail, "note": "no name match and no usable date (EXIF/flickr: " + str(detail.get("flickr")) + ")"}
+            return "no_exif", {**detail, "note": ((detail["note"] + "; ") if detail.get("note") else "no name match; ") + "no usable date for time search (flickr: " + str(detail.get("flickr")) + ")"}
         # Compare wall-clock time: Immich's localDateTime is the camera's wall-clock time
         # (stored as if UTC). The *stored* UTC time differs by the camera's offset, which we
         # don't know, so fetch a wide window and filter on localDateTime.
