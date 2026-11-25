@@ -297,12 +297,46 @@ def process(src, index, im, maps, args):
                 detail["flickr"] = fnote
         return taken
 
+    def time_assets(t, w):
+        """Assets whose wall-clock time (Immich localDateTime) is within w seconds of t.
+        Immich stores UTC and we don't know the camera's offset, so fetch a wide window
+        (+-max_tz_offset hours) and filter locally on localDateTime."""
+        out = []
+        for a in im.by_time(t, args.max_tz_offset * 3600 + w):
+            s_ = a.get("localDateTime")
+            try:
+                lt = datetime.fromisoformat(s_.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if close(lt, t, w):
+                out.append(a)
+        return out
+
+    def find_by_paths(host_paths):
+        """Immich assets for these library files. The per-path lookup is slow (~0.5 s), so
+        first try one fast time search using the library file's own EXIF time and pick
+        out assets by exact originalPath; anything not found that way uses the path lookup."""
+        wanted = list(dict.fromkeys(to_container(h, maps) for h in host_paths))
+        found = {}
+        if args.time_first:
+            t = next((x for x in (read_exif(h)[0] for h in host_paths) if x), None) or taken
+            if t is not None:
+                for a in time_assets(t, args.date_window):
+                    if a.get("originalPath") in wanted:
+                        found[a["originalPath"]] = a
+        detail["lookup"] = "time" if found and len(found) == len(wanted) else (
+            "mixed" if found else "path")
+        for p in wanted:
+            if p not in found:
+                found.update({a["originalPath"]: a for a in im.by_path(p)})
+        return [found[p] for p in wanted if p in found]
+
     asset = None
     how = None
 
     if len(hits) == 1:
         how = "unique-name"
-        found = im.by_path(to_container(hits[0], maps))
+        found = find_by_paths([hits[0]])
         if found:
             asset = found[0]
         else:
@@ -322,9 +356,7 @@ def process(src, index, im, maps, args):
             hits = []
         else:
             how = "name+exif"
-            found = []
-            for h in good:
-                found += im.by_path(to_container(h, maps))
+            found = find_by_paths(good)
             if len(found) == 1:
                 asset = found[0]
             elif len(found) > 1:
@@ -337,19 +369,7 @@ def process(src, index, im, maps, args):
         how = "time-search"
         if need_date() is None:
             return "no_exif", {**detail, "note": ((detail["note"] + "; ") if detail.get("note") else "no name match; ") + "no usable date for time search (flickr: " + str(detail.get("flickr")) + ")"}
-        # Compare wall-clock time: Immich's localDateTime is the camera's wall-clock time
-        # (stored as if UTC). The *stored* UTC time differs by the camera's offset, which we
-        # don't know, so fetch a wide window and filter on localDateTime.
-        raw = im.by_time(taken, args.max_tz_offset * 3600 + win)
-        items = []
-        for a in raw:
-            s_ = a.get("localDateTime")
-            try:
-                t = datetime.fromisoformat(s_.replace("Z", "+00:00"))
-            except Exception:
-                continue
-            if close(t, taken, win):
-                items.append(a)
+        items = time_assets(taken, win)
         detail["time_candidates"] = len(items)
         def dims(a):
             e = a.get("exifInfo") or {}
@@ -398,6 +418,9 @@ def main():
                          "Default: the five mounts in DEFAULT_MAPS (older, newer, 3 phone dirs)")
     ap.add_argument("--apply", action="store_true", help="actually write to Immich (default: dry run)")
     ap.add_argument("--date-window", type=float, default=1.0, help="EXIF time tolerance in seconds")
+    ap.add_argument("--no-time-first", dest="time_first", action="store_false",
+                    help="look files up by path only (slow, ~0.5 s each); default is to try a fast "
+                         "time search first and fall back to the path lookup")
     ap.add_argument("--max-tz-offset", type=float, default=14.0,
                     help="max camera UTC offset (hours) considered when time-searching")
     ap.add_argument("--flickr-root", default="/mnt/disk/flickrBackup/jamie/",

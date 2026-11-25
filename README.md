@@ -14,6 +14,7 @@ export IMMICH_API_KEY=xxxx
 | Script | What it does |
 |---|---|
 | [`immich_favourites.py`](immich_favourites.py) | Marks photos as favourites in Immich based on a directory of favourite copies. The main script, documented below. |
+| [`tz_probe.py`](tz_probe.py) | Read-only test: compares what Immich stored (UTC time, `timeZone`) with each file's own EXIF, to show which timezone offset Immich applies. |
 | [`albumscans.py`](albumscans.py) | Adds every asset under a scans folder to an album (`Film Scans`), creating the album if needed. |
 | [`tagscans.py`](tagscans.py) | Tags every asset under a scans folder with a tag (`Abba Slide Scans`). |
 | [`favs.py`](favs.py) | Earlier favourites script: searches Immich by filename for each source file, writes `favourite_matches.csv`, and favourites unique matches with `--apply`. |
@@ -30,6 +31,11 @@ and a large library indexed by Immich. This script finds the originals and favou
 Matching on the file system first and then looking assets up by path means the script rarely has
 to search the whole Immich library.
 
+Immich's path lookup is slow (about 0.5 s per call in testing), while a time-window search takes
+10-75 ms. So when a file is found on disk, the script first runs one time search using that file's
+EXIF time and picks the asset by exact `originalPath`. Only if that misses does it use the path
+lookup. The state file records which was used as `lookup` (`time`, `path` or `mixed`).
+
 ### How it matches
 
 For each file in `--source`:
@@ -43,8 +49,13 @@ For each file in `--source`:
 
 Time search compares the source's wall-clock EXIF time with each asset's `localDateTime`, because
 Immich stores UTC and the camera's offset isn't known. It fetches a window of `--max-tz-offset`
-hours either side, then filters on `localDateTime`, the aspect ratio of the picture, and the
-filename.
+hours either side (one query, 15-75 ms in testing), then filters on `localDateTime`, the aspect
+ratio of the picture, and the filename.
+
+`tz_probe.py` is a read-only test of how Immich picks the offset: the offset tag is always honoured,
+GPS gives the local zone with summer time, and files with neither get UTC (apart from some Nikon
+files, probably from maker notes). Narrowing the search to specific offsets wasn't worth the
+complexity, since the wide query is already fast.
 
 ### Flickr backups
 
@@ -106,6 +117,7 @@ so list every root you want searched.
 | `--search-root HOST=CONTAINER` | see above | Library root to search; repeatable |
 | `--apply` | off | Actually write to Immich |
 | `--date-window` | `1.0` | EXIF time tolerance in seconds |
+| `--no-time-first` | off | Look files up by path only. By default a fast time search is tried first (see below) |
 | `--max-tz-offset` | `14.0` | Largest camera UTC offset (hours) considered in time search |
 | `--ties` | `pick` | When several versions match: `pick` one, `skip` (log as ambiguous), or favourite `all` |
 | `--ignore-case` | off | Case-insensitive filename matching |

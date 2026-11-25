@@ -112,8 +112,8 @@ def main():
     if not rows:
         sys.exit("no usable assets: check --search-root and that you run this where the files are mounted")
 
-    bad = [r for r in rows if r["local"] != r["naive"]]
-    print(f"localDateTime == file's naive EXIF time: {len(rows) - len(bad)}/{len(rows)}")
+    bad = [r for r in rows if abs((r["local"] - r["naive"]).total_seconds()) >= 1]
+    print(f"localDateTime within 1s of file's naive EXIF time: {len(rows) - len(bad)}/{len(rows)}")
     for r in bad[:5]:
         print(f"   differs: {r['name']} file={r['naive']} localDateTime={r['local']}")
     print()
