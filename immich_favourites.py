@@ -346,20 +346,31 @@ def process(src, index, im, maps, args):
     elif len(hits) > 1:
         if need_date() is None:
             return "no_exif", {**detail, "note": "multiple name matches but source has no EXIF date"}
-        good = []
-        for h in hits:
-            t, _ = read_exif(h)
-            if t and close(t, taken, win):
-                good.append(h)
-        if len(good) == 0:
-            detail["note"] = "name matches but none have matching EXIF date, trying time search"
-            hits = []
+        found = []
+        if args.time_first:
+            # No disk reads: one time search, keep assets whose path is one of the candidates.
+            cand = {to_container(h, maps) for h in hits}
+            found = [a for a in time_assets(taken, win) if a.get("originalPath") in cand]
+            detail["lookup"] = "time"
+            if not found:
+                detail["note"] = "name matches but none in immich at that time, trying time search"
+                hits = []
         else:
+            good = []
+            for h in hits:
+                t, _ = read_exif(h)  # slow: opens every candidate file
+                if t and close(t, taken, win):
+                    good.append(h)
+            if not good:
+                detail["note"] = "name matches but none have matching EXIF date, trying time search"
+                hits = []
+            else:
+                found = find_by_paths(good)
+        if found:
             how = "name+exif"
-            found = find_by_paths(good)
             if len(found) == 1:
                 asset = found[0]
-            elif len(found) > 1:
+            else:
                 asset, res = resolve_tie(found, args, detail,
                                          f"{len(found)} files share name+date")
                 if res:

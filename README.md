@@ -42,7 +42,8 @@ For each file in `--source`:
 
 1. Search the library roots (host paths) for a file with the same name.
    - **One hit:** look the asset up in Immich by its `originalPath`.
-   - **Several hits:** compare the EXIF capture time of the source with each hit and use the matching one(s).
+   - **Several hits:** run a time search on the source's capture time and keep the assets whose path is one
+     of the hits (no file reads). With `--no-time-first` it instead reads each hit's EXIF date from disk, which is slow.
    - **No hits** (or the hit isn't in Immich, or none has a matching date): search Immich by capture time.
 2. If several versions still match, pick one (`--ties`, see below).
 3. Favourite the asset. Already-favourite assets are skipped.
