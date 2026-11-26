@@ -103,7 +103,7 @@ class Stream:
 
     @classmethod
     def load(cls, fl, uid, sort, cache, refresh, logf):
-        meta = {"uid": uid, "sort": sort, "oauth": fl.oauth}
+        meta = {"uid": uid, "sort": sort, "oauth": fl.oauth, "v": 2}  # v2: fetched in date ranges
         if not refresh and os.path.exists(cache):
             try:
                 with open(cache) as f:
@@ -115,17 +115,57 @@ class Stream:
                     return cls(c["photos"])
             except Exception as e:
                 log(f"stream cache unreadable ({e}), rebuilding", logf)
-        out, page = [], 1
-        while True:
-            r = fl.call("flickr.photos.search", user_id=uid, extras="date_taken,o_dims",
-                        per_page=500, page=page, sort=sort)["photos"]
-            out += [{k: p.get(k) for k in cls.KEEP} for p in r["photo"]]
-            log(f"photostream: page {page}/{r['pages']}, {len(out)}/{r['total']} photos", logf)
-            if page >= int(r["pages"]):
-                break
-            page += 1
+        # flickr.photos.search returns at most ~4000 photos per query (later pages repeat), so a
+        # big photostream is fetched in date ranges, splitting any range that is too big.
+        taken = "taken" in sort
+        epoch, lo0, hi0 = datetime(1970, 1, 1), datetime(1800, 1, 1), datetime.now() + timedelta(days=2)
+        if not taken:
+            lo0 = epoch
+
+        def bound(d):
+            return d.strftime("%Y-%m-%d %H:%M:%S") if taken else int((d - epoch).total_seconds())
+
+        key = "taken" if taken else "upload"
+        expected = int(fl.call("flickr.photos.search", user_id=uid, per_page=1)["photos"]["total"])
+        log(f"photostream: flickr reports {expected} photos, fetching by {key} date ranges", logf)
+        chunks = []
+
+        def fetch(lo, hi):
+            q = dict(user_id=uid, extras="date_taken,o_dims", per_page=500, sort=sort,
+                     **{f"min_{key}_date": bound(lo), f"max_{key}_date": bound(hi)})
+            first = fl.call("flickr.photos.search", page=1, **q)["photos"]
+            total = int(first["total"])
+            if total > 3500 and (hi - lo).total_seconds() > 2:
+                mid = lo + (hi - lo) / 2
+                fetch(lo, mid)
+                fetch(mid, hi)
+                return
+            photos, page, r = list(first["photo"]), 1, first
+            while page < int(r["pages"]):
+                page += 1
+                r = fl.call("flickr.photos.search", page=page, **q)["photos"]
+                photos += r["photo"]
+            chunks.append(photos)
+            log(f"  {lo:%Y-%m-%d} .. {hi:%Y-%m-%d}: {len(photos)} photos", logf)
+
+        fetch(lo0, hi0)
+        if sort.endswith("desc"):
+            chunks.reverse()   # ranges were visited oldest first
+        out, seen = [], set()
+        for ch in chunks:
+            for p in ch:
+                if p["id"] not in seen:
+                    seen.add(p["id"])
+                    out.append({k: p.get(k) for k in cls.KEEP})
+        log(f"photostream: {len(out)} photos fetched (flickr reported {expected})", logf)
+        if len(out) < expected:
+            log(f"WARNING: {expected - len(out)} photos missing (e.g. no date); neighbours near "
+                f"them may be wrong", logf)
         with open(cache, "w") as f:
             json.dump({"meta": meta, "built": time.time(), "photos": out}, f)
+        dates = sorted(p["datetaken"] for p in out if p.get("datetaken"))
+        if dates:
+            log(f"photostream: taken dates run {dates[0][:10]} to {dates[-1][:10]}", logf)
         return cls(out)
 
 
