@@ -91,6 +91,50 @@ class Flickr:
             page += 1
 
 
+class Stream:
+    """The whole photostream in a fixed order, so neighbours can be found in memory.
+    (flickr.photos.getContext also gives prev/next, but only one step per API call.)"""
+
+    KEEP = ("id", "title", "datetaken", "datetakengranularity", "datetakenunknown", "width_o", "height_o")
+
+    def __init__(self, photos):
+        self.photos = photos
+        self.pos = {str(p["id"]): i for i, p in enumerate(photos)}
+
+    @classmethod
+    def load(cls, fl, uid, sort, cache, refresh, logf):
+        meta = {"uid": uid, "sort": sort, "oauth": fl.oauth}
+        if not refresh and os.path.exists(cache):
+            try:
+                with open(cache) as f:
+                    c = json.load(f)
+                if c.get("meta") == meta:
+                    log(f"photostream loaded from {cache}: {len(c['photos'])} photos, "
+                        f"{(time.time() - c['built']) / 86400:.1f} days old (--refresh-stream to rebuild)",
+                        logf)
+                    return cls(c["photos"])
+            except Exception as e:
+                log(f"stream cache unreadable ({e}), rebuilding", logf)
+        out, page = [], 1
+        while True:
+            r = fl.call("flickr.photos.search", user_id=uid, extras="date_taken,o_dims",
+                        per_page=500, page=page, sort=sort)["photos"]
+            out += [{k: p.get(k) for k in cls.KEEP} for p in r["photo"]]
+            log(f"photostream: page {page}/{r['pages']}, {len(out)}/{r['total']} photos", logf)
+            if page >= int(r["pages"]):
+                break
+            page += 1
+        with open(cache, "w") as f:
+            json.dump({"meta": meta, "built": time.time(), "photos": out}, f)
+        return cls(out)
+
+
+def numeric_title(p):
+    """int if the Flickr title is just digits (an untouched scan name like '0045'), else None."""
+    m = re.fullmatch(r"\s*(\d+)\s*", re.sub(r"\.[A-Za-z0-9]{2,4}$", "", p.get("title") or ""))
+    return int(m.group(1)) if m else None
+
+
 class BackupById:
     """Date lookup in the flickr backup by Flickr photo ID, using FlickrIndex (cached crawl)."""
 
@@ -150,44 +194,34 @@ def photo_time(p, backup, detail, args):
     return None, None
 
 
-def process(p, im, backup, args):
-    """Return (status, detail). Statuses: favourited/would_favourite/already_favourite/
-    not_found/ambiguous/no_date/error."""
-    title = p.get("title", "")
-    detail = {"title": title}
+def flickr_size(p):
+    try:
+        return int(p["width_o"]), int(p["height_o"])
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def asset_dims(a):
+    e = a.get("exifInfo") or {}
+    w, h = e.get("exifImageWidth"), e.get("exifImageHeight")
+    return (w, h) if w and h else None
+
+
+def candidates_by_time(p, im, backup, args, detail):
+    """Immich assets at the photo's capture time with a similar shape. (None, note) if no date."""
     t, win = photo_time(p, backup, detail, args)
     if t is None:
-        return "no_date", {**detail, "note": "no usable date from flickr or the backup"}
+        return None
     detail["time"] = t.strftime("%Y-%m-%d %H:%M:%S")
-
-    try:
-        size = (int(p["width_o"]), int(p["height_o"]))
-    except (KeyError, ValueError, TypeError):
-        size = None
-
-    def dims(a):
-        e = a.get("exifInfo") or {}
-        w, h = e.get("exifImageWidth"), e.get("exifImageHeight")
-        return (w, h) if w and h else None
-
     items = time_assets(im, t, win, args.max_tz_offset)
     detail["time_candidates"] = len(items)
     if not args.no_ratio:
-        items = [a for a in items if ratio_close(size, dims(a))]
-    if not items:
-        return "not_found", detail
-    if len(items) > 1 and norm(title):
-        named = [a for a in items if norm(a.get("originalFileName")) == norm(title)]
-        if named:
-            items = named
-            detail["name_match"] = True
-    if len(items) > 1:
-        asset, res = resolve_tie(items, args, detail, f"{len(items)} immich assets at that time")
-        if res:
-            return res
-        assets = asset if isinstance(asset, list) else [asset]
-    else:
-        assets = items
+        size = flickr_size(p)
+        items = [a for a in items if ratio_close(size, asset_dims(a))]
+    return items
+
+
+def finish(assets, detail, im, args):
     detail.update(assets=[a["id"] for a in assets], paths=[a.get("originalPath") for a in assets])
     todo = [a for a in assets if not a.get("isFavorite")]
     if not todo:
@@ -197,6 +231,97 @@ def process(p, im, backup, args):
             im.favourite(a["id"])
         return "favourited", detail
     return "would_favourite", detail
+
+
+def via_neighbours(p, stream, im, backup, args, detail):
+    """Film scans whose Flickr title was changed: walk the photostream to the nearest photos whose
+    title is still just a number, find those in Immich, and work out this photo's original file
+    name from the distance. Returns an asset or None (reason in detail['neighbours'])."""
+    i = stream.pos.get(str(p["id"]))
+    if i is None:
+        detail["neighbours"] = "photo not in photostream"
+        return None
+
+    def nearest(step):
+        for d in range(1, args.neighbour_steps + 1):
+            j = i + step * d
+            if not 0 <= j < len(stream.photos):
+                return None
+            n = numeric_title(stream.photos[j])
+            if n is not None:
+                return stream.photos[j], d, n
+        return None
+
+    sign = 1 if args.scan_order == "asc" else -1
+    before, after = nearest(-1), nearest(+1)
+    guesses = []   # (anchor flickr photo, wanted number)
+    if before:
+        guesses.append((before[0], before[2] + sign * before[1]))
+    if after:
+        guesses.append((after[0], after[2] - sign * after[1]))
+    if not guesses:
+        detail["neighbours"] = f"no numeric title within {args.neighbour_steps} photos either way"
+        return None
+    if len(guesses) == 2 and guesses[0][1] != guesses[1][1]:
+        detail["neighbours"] = (f"neighbours disagree: {before[0]['title']} (-{before[1]}) says "
+                                f"{guesses[0][1]}, {after[0]['title']} (+{after[1]}) says {guesses[1][1]}")
+        return None
+    if len(guesses) == 1 and not args.one_sided:
+        detail["neighbours"] = "only one numeric neighbour (use --one-sided to accept)"
+        return None
+    wanted = guesses[0][1]
+    detail["wanted_number"] = wanted
+    detail["anchors"] = [q["id"] for q, _ in guesses]
+
+    for q, _n in guesses:
+        qn = numeric_title(q)
+        cands = candidates_by_time(q, im, backup, args, {}) or []
+        anchors = [a for a in cands
+                   if re.fullmatch(r"\d+", os.path.splitext(a.get("originalFileName") or "")[0])
+                   and int(os.path.splitext(a["originalFileName"])[0]) == qn]
+        if len(anchors) != 1:
+            detail["neighbours"] = f"anchor {q['title']} ({q['id']}) matched {len(anchors)} immich assets"
+            continue
+        anchor = anchors[0]
+        stem, ext = os.path.splitext(anchor["originalFileName"])
+        path = os.path.dirname(anchor["originalPath"]) + "/" + str(wanted).zfill(len(stem)) + ext
+        found = im.by_path(path)
+        if not found:
+            detail["neighbours"] = f"worked out {path} but it is not in immich"
+            continue
+        if not args.no_ratio and not ratio_close(flickr_size(p), asset_dims(found[0])):
+            detail["neighbours"] = f"{path} found but its shape differs from the flickr photo"
+            continue
+        detail["neighbours"] = f"from {q['title']} ({q['id']}): {path}"
+        return found[0]
+    return None
+
+
+def process(p, im, backup, stream, args):
+    """Return (status, detail). Statuses: favourited/would_favourite/already_favourite/
+    not_found/ambiguous/no_date/error."""
+    title = p.get("title", "")
+    detail = {"title": title}
+    items = candidates_by_time(p, im, backup, args, detail)
+    if items is None:
+        detail["note"] = "no usable date from flickr or the backup"
+    elif items:
+        if len(items) > 1 and norm(title):
+            named = [a for a in items if norm(a.get("originalFileName")) == norm(title)]
+            if named:
+                items = named
+                detail["name_match"] = True
+        if len(items) == 1:
+            return finish(items, detail, im, args)
+        asset, res = resolve_tie(items, args, detail, f"{len(items)} immich assets at that time")
+        return res if res else finish(asset if isinstance(asset, list) else [asset], detail, im, args)
+
+    if stream is not None:
+        asset = via_neighbours(p, stream, im, backup, args, detail)
+        if asset:
+            detail["time_from"] = "photostream neighbours"
+            return finish([asset], detail, im, args)
+    return ("no_date" if items is None else "not_found"), detail
 
 
 def main():
@@ -220,6 +345,21 @@ def main():
     ap.add_argument("--max-tz-offset", type=float, default=14.0,
                     help="max camera UTC offset (hours) considered when time-searching")
     ap.add_argument("--no-ratio", action="store_true", help="don't filter on picture shape")
+    ap.add_argument("--no-neighbours", dest="neighbours", action="store_false",
+                    help="don't try to work out renamed film scans from neighbouring photos")
+    ap.add_argument("--stream-sort", default="date-posted-asc",
+                    choices=["date-posted-asc", "date-taken-asc", "date-posted-desc", "date-taken-desc"],
+                    help="photostream order used to find neighbours (should match the order the scans "
+                         "were uploaded in)")
+    ap.add_argument("--scan-order", choices=["asc", "desc"], default="asc",
+                    help="do scan numbers increase (asc) or decrease along the stream order?")
+    ap.add_argument("--neighbour-steps", type=int, default=50,
+                    help="how far to walk to find a photo whose title is just a number")
+    ap.add_argument("--one-sided", action="store_true",
+                    help="accept a guess from a numeric neighbour on one side only (default needs both "
+                         "sides to agree)")
+    ap.add_argument("--stream-cache", default="flickr-stream.json", help="cache for the photostream list")
+    ap.add_argument("--refresh-stream", action="store_true", help="re-download the photostream list")
     ap.add_argument("--ties", choices=["pick", "skip", "all"], default="pick",
                     help="when several assets match equally: pick one (default), skip, or favourite all")
     ap.add_argument("--flickr-root", default="/mnt/disk/flickrBackup/jamie/",
@@ -270,6 +410,9 @@ def main():
 
     backup = (BackupById(FlickrIndex(args.flickr_root.rstrip("/") or "/", args.flickr_cache,
                                      args.reindex_flickr, logf)) if args.flickr_root else None)
+    stream = None
+    if args.neighbours:
+        stream = Stream.load(fl, uid, args.stream_sort, args.stream_cache, args.refresh_stream, logf)
     im = Immich(args.url, args.api_key)
     stats = Counter()
     start, n_done = time.time(), 0
@@ -279,7 +422,7 @@ def main():
             if pid in done:
                 continue
             try:
-                status, detail = process(p, im, backup, args)
+                status, detail = process(p, im, backup, stream, args)
             except Exception as e:
                 status, detail = "error", {"title": p.get("title"), "error": repr(e)}
             stats[status] += 1
@@ -289,7 +432,7 @@ def main():
             label = f"{pid} {detail.get('title')!r}"
             if status in ("ambiguous", "not_found", "no_date", "error"):
                 log(f"[{i}/{total}] {status.upper()} {label} "
-                    f"{detail.get('note', detail.get('error', detail.get('time', '')))} "
+                    f"{detail.get('neighbours') or detail.get('note', detail.get('error', detail.get('time', '')))} "
                     f"https://www.flickr.com/photo.gne?id={pid}", logf)
                 if status == "ambiguous":
                     for aid in detail.get("assets", []):
