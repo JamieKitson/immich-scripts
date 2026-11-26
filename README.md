@@ -108,9 +108,11 @@ For each tagged photo it:
 4. Favourites the asset (only with `--apply`).
 
 Flickr needs an [API key](https://www.flickr.com/services/apps/create/). Without OAuth the API only
-returns public photos; for private ones also pass `--flickr-secret`, `--flickr-token` and
-`--flickr-token-secret` (or `FLICKR_API_SECRET`, `FLICKR_OAUTH_TOKEN`, `FLICKR_OAUTH_SECRET`),
-install `requests-oauthlib`, and use `--flickr-user me`.
+returns public photos. For private ones, run [`flickr_auth.py`](flickr_auth.py) once (it needs
+`pip install requests-oauthlib` and `FLICKR_API_KEY` / `FLICKR_API_SECRET` set). It prints a URL to
+authorise (read access only), asks for the code Flickr shows, then prints
+`FLICKR_OAUTH_TOKEN` and `FLICKR_OAUTH_SECRET`. Export those with the key and secret and use
+`--flickr-user me`.
 
 ```bash
 export IMMICH_API_KEY=xxxx FLICKR_API_KEY=yyyy
