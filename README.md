@@ -14,6 +14,7 @@ export IMMICH_API_KEY=xxxx
 | Script | What it does |
 |---|---|
 | [`immich_favourites.py`](immich_favourites.py) | Marks photos as favourites in Immich based on a directory of favourite copies. The main script, documented below. |
+| [`flickr_favourites.py`](flickr_favourites.py) | Favourites in Immich the photos tagged `myfavs` on Flickr, found by capture time. Documented below. |
 | [`tz_probe.py`](tz_probe.py) | Read-only test: compares what Immich stored (UTC time, `timeZone`) with each file's own EXIF, to show which timezone offset Immich applies. |
 | [`albumscans.py`](albumscans.py) | Adds every asset under a scans folder to an album (`Film Scans`), creating the album if needed. |
 | [`tagscans.py`](tagscans.py) | Tags every asset under a scans folder with a tag (`Abba Slide Scans`). |
@@ -88,6 +89,41 @@ pip install requests pillow
 
 # for real
 ./immich_favourites.py --url http://localhost:2283/api --apply
+```
+
+## flickr_favourites.py
+
+Favourites in Immich every photo of yours tagged `myfavs` (change with `--tag`) on Flickr. It imports
+helpers from `immich_favourites.py`, so keep the two files together.
+
+For each tagged photo it:
+
+1. Gets the capture time from the Flickr API (`date_taken`). If Flickr doesn't know it (the date is
+   the upload date, or only a month or year), it looks the photo up by its Flickr ID in the backup
+   (`flickr-index.json`) and uses that file's EXIF date, or failing that the date in its folder and name.
+2. Searches Immich by that time, the same way as `immich_favourites.py` (wall-clock time against
+   `localDateTime`, within `--date-window`), and drops assets whose picture shape differs.
+3. If several assets are left and the Flickr title is still the original file name, keeps the ones
+   with that name. Anything still tied is resolved with `--ties` (default `pick`).
+4. Favourites the asset (only with `--apply`).
+
+Flickr needs an [API key](https://www.flickr.com/services/apps/create/). Without OAuth the API only
+returns public photos; for private ones also pass `--flickr-secret`, `--flickr-token` and
+`--flickr-token-secret` (or `FLICKR_API_SECRET`, `FLICKR_OAUTH_TOKEN`, `FLICKR_OAUTH_SECRET`),
+install `requests-oauthlib`, and use `--flickr-user me`.
+
+```bash
+export IMMICH_API_KEY=xxxx FLICKR_API_KEY=yyyy
+./flickr_favourites.py --flickr-user jamiekitson --limit 20     # dry run
+./flickr_favourites.py --flickr-user jamiekitson --apply
+```
+
+State goes to `flickr-favourites-dryrun.jsonl` or `-apply.jsonl`, keyed by Flickr photo ID (`file`), and
+the run resumes the same way as above. Statuses are as above, with `no_date` in place of `no_exif`.
+List the photos that weren't found:
+
+```bash
+jq -r 'select(.status=="not_found") | "\(.file) \(.title)"' flickr-favourites-dryrun.jsonl
 ```
 
 ### Library paths
