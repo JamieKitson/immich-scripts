@@ -44,7 +44,7 @@ END = datetime(2017, 5, 10, 23, 59, 59)
 MONTHS = {(2017, 4), (2017, 5)}
 
 P9_RE = re.compile(r"^IMG[-_]\d{8}[-_]\d{6}$", re.I)
-WA_RE = re.compile(r"^IMG[-_]\d{8}[-_]WA\d+$", re.I)
+WA_RE = re.compile(r"^(IMG|VID)[-_]\d{8}[-_]WA\d+$", re.I)
 GRUFFALO_RE = re.compile(r"^Gruffalo\b", re.I)
 VID_RE = re.compile(r"^VID\b", re.I)
 
@@ -62,10 +62,10 @@ def decide(path):
         return "skip", "invalid date in path", None, None
     if not START <= when <= END:
         return "skip", "outside date range", when, None
+    if WA_RE.match(title):
+        return "skip", "WhatsApp image/video", when, None
     if VID_RE.match(title):
         return "warn", "VID file in range (unexpected)", when, None
-    if WA_RE.match(title):
-        return "skip", "WhatsApp image", when, None
     if P9_RE.match(title):
         reason = "P9 IMG name"
     elif GRUFFALO_RE.match(title):
@@ -94,7 +94,7 @@ def flickr_client():
 
 def video_candidates(fl, pid, allow_transcoded):
     """Return (list of (label, url, ext|None), note). Original first; note says what Flickr offers."""
-    sizes = {x["label"]: x for x in fl.call("flickr.photos.getSizes", photo_id=pid)["sizes"]["size"]}
+    sizes = {str(x["label"]): x for x in fl.call("flickr.photos.getSizes", photo_id=pid)["sizes"]["size"]}
     cands = []
     if "Video Original" in sizes:
         cands.append(("Video Original", sizes["Video Original"]["source"], None))
