@@ -280,34 +280,55 @@ def via_neighbours(p, ctx, im, args, detail):
         return None
 
     before, after = nearest("prev"), nearest("next")
+    in_roll = lambda n: 1 <= n <= args.max_frame
+
+    def guess(anchor, is_before, order):
+        """Number this photo would have if the numbers run in `order` along the stream."""
+        sgn = 1 if order == "asc" else -1
+        return anchor[2] + sgn * anchor[1] if is_before else anchor[2] - sgn * anchor[1]
+
+    chosen = None   # (wanted number, order, anchor ids, how)
     if before and after:
-        up = (before[2] + before[1], after[2] - after[1])      # numbers rise along the stream
-        down = (before[2] - before[1], after[2] + after[1])    # numbers fall along the stream
-        if up[0] == up[1]:
-            wanted, order = up[0], "asc"
-        elif down[0] == down[1]:
-            wanted, order = down[0], "desc"
-        else:
-            detail["neighbours"] = (f"neighbours don't line up: {ctx.title(before[0])} (-{before[1]}) and "
-                                    f"{ctx.title(after[0])} (+{after[1]})")
-            return None
-        anchors = [before[0], after[0]]
+        for order in ("asc", "desc"):
+            w1, w2 = guess(before, True, order), guess(after, False, order)
+            if w1 == w2 and in_roll(w1):
+                chosen = (w1, order, [before[0], after[0]], "both agree")
+                break
+        if chosen is None:
+            # The two don't line up (gaps, or a roll boundary between them). Take the direction from
+            # the numbers themselves and trust the closer anchor, skipping any answer outside a roll.
+            order = "asc" if before[2] < after[2] else "desc" if before[2] > after[2] else args.scan_order
+            near = sorted([(before[1], True, before), (after[1], False, after)], key=lambda x: x[0])
+            opts = [(d, guess(a, b, order), a) for d, b, a in near if in_roll(guess(a, b, order))]
+            if len(opts) == 2 and opts[0][0] == opts[1][0] and opts[0][1] != opts[1][1]:
+                detail["neighbours"] = (f"{ctx.title(before[0])} (-{before[1]}) and {ctx.title(after[0])} "
+                                        f"(+{after[1]}) disagree and are equally close")
+                return None
+            if opts:
+                d, w, a = opts[0]
+                chosen = (w, order, [a[0]], f"closest of two that disagree ({ctx.title(a[0])}, {d} away)")
     elif before or after:
         if not args.one_sided:
             detail["neighbours"] = "only one numeric neighbour (use --one-sided to accept)"
             return None
-        sign = 1 if args.scan_order == "asc" else -1
-        wanted = before[2] + sign * before[1] if before else after[2] - sign * after[1]
-        order, anchors = args.scan_order, [(before or after)[0]]
+        a, is_before = (before, True) if before else (after, False)
+        ok_orders = [o for o in (args.scan_order, "desc" if args.scan_order == "asc" else "asc")
+                     if in_roll(guess(a, is_before, o))]
+        if ok_orders:   # numbers outside a roll rule an order out; if both fit, use --scan-order
+            chosen = (guess(a, is_before, ok_orders[0]), ok_orders[0], [a[0]], "one side only")
     else:
         detail["neighbours"] = f"no numeric title within {args.neighbour_steps} photos either way"
         return None
-    detail.update(wanted_number=wanted, scan_order=order, anchors=anchors)
+    if chosen is None:
+        detail["neighbours"] = f"every number worked out from the neighbours is outside 1-{args.max_frame}"
+        return None
+    wanted, order, anchors, how = chosen
+    detail.update(wanted_number=wanted, scan_order=order, anchors=anchors, neighbour_match=how)
 
     film = args.film
     names = [ctx.title(a) for a in anchors]
-    # The scans have no date, so find them by number in the film folder. Both anchors must be in the
-    # same folder (one roll); the wanted number must be in that folder too.
+    # The scans have no date, so find them by number in the film folder. The anchors used must be in
+    # the same folder (one roll); the wanted number must be in that folder too.
     dirs = None
     for aid in anchors:
         ds = {d for d, _ in film.find(numeric_title({"title": ctx.title(aid)}))}
@@ -401,6 +422,8 @@ def main():
                     help="don't try to work out renamed film scans from neighbouring photos")
     ap.add_argument("--scan-order", choices=["asc", "desc"], default="asc",
                     help="do scan numbers increase (asc) or decrease along the stream order?")
+    ap.add_argument("--max-frame", type=int, default=40,
+                    help="highest frame number on a roll (a roll is 36-38 frames; frames are 1 or more)")
     ap.add_argument("--neighbour-steps", type=int, default=5,
                     help="how far to walk to find a photo whose title is just a number")
     ap.add_argument("--one-sided", action="store_true",

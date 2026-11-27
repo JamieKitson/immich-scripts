@@ -115,11 +115,13 @@ whose title is still just a number. Scans have no date, so it finds those files 
 default `/external/older/backup/Film`), walked once per run. The distance gives the number for this photo:
 with `0010` one step before and `0013` two steps after, the photo is `0011`. Both neighbours must be in
 the same folder (one roll), and the wanted file is looked up in Immich by its path there, so a number that
-exists in several rolls is only used if the folder is unambiguous. Whether numbers rise or fall along the stream is worked out from the two neighbours, which
-must agree (this also checks the stream order). `--one-sided` accepts a single neighbour, using
-`--scan-order`. The result is logged as `neighbours` in the state file. Everything fetched is cached
+exists in several rolls is only used if the folder is unambiguous. Whether numbers rise or fall along the stream is worked out from the neighbours. If both agree, that
+is the answer. If they don't (gaps, or a roll boundary between them), the closer one is used, with the
+direction taken from the two numbers; equally close and disagreeing is left alone. Any number outside
+1 to `--max-frame` (default 40) is ruled out, so for example `0001` can only count upwards. `--one-sided`
+accepts a single neighbour, using `--scan-order` if both directions fit in a roll. The result is logged as `neighbours` in the state file. Everything fetched is cached
 in `flickr-context.json` (delete it if you reorder your photostream), so neighbouring photos in a roll
-share their walks. Other options: `--neighbour-steps` (default 5, since a roll is at most 38 frames and few are public and titled), `--no-neighbours`.
+share their walks. Other options: `--max-frame`, `--neighbour-steps` (default 5, since a roll is at most 38 frames and few are public and titled), `--no-neighbours`.
 
 (Downloading the whole photostream instead is a poor fit: `flickr.photos.search` caps each query, so
 it would need many date-range queries for a library of 70k photos.)
