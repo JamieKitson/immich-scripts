@@ -15,6 +15,7 @@ export IMMICH_API_KEY=xxxx
 |---|---|
 | [`immich_favourites.py`](immich_favourites.py) | Marks photos as favourites in Immich based on a directory of favourite copies. The main script, documented below. |
 | [`flickr_favourites.py`](flickr_favourites.py) | Favourites in Immich the photos tagged `myfavs` on Flickr, found by capture time. Documented below. |
+| [`flickr_check.py`](flickr_check.py) | Read-only audit: checks every photo in the Flickr backup for presence in Immich and writes `flickr-check.csv`. Documented in its docstring (`--help`). |
 | [`tz_probe.py`](tz_probe.py) | Read-only test: compares what Immich stored (UTC time, `timeZone`) with each file's own EXIF, to show which timezone offset Immich applies. |
 | [`albumscans.py`](albumscans.py) | Adds every asset under a scans folder to an album (`Film Scans`), creating the album if needed. |
 | [`tagscans.py`](tagscans.py) | Tags every asset under a scans folder with a tag (`Abba Slide Scans`). |

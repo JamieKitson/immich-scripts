@@ -149,6 +149,9 @@ def handle_video(fl, pid, path, when, args):
         for label, url, ext in cands:
             got, existed = download(fl, url, base, ext)
             if got:
+                if not existed:  # Immich falls back to mtime when a video has no creation metadata
+                    ts = when.timestamp()
+                    os.utime(got, (ts, ts))
                 print(f"  video {pid}: {'already there' if existed else 'downloaded'} {label} -> {got}")
                 return ("exists" if existed else "video_downloaded"), label, got
         print(f"  video {pid}: download failed for all of {[c[0] for c in cands]} ({note})")
