@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy missing Nikon D70s / Canon SD800 photos from the Flickr backup into the main library.
+"""Copy missing photos (everything except the Nikon D80) from the Flickr backup into the main library.
 
 Flickr backup files look like  <root>/YYYY-MM/DD-HH-MM-<name>-<flickr id>.<ext>
 e.g.  2007-03/29-12-52-IMG-1071-443720252.jpg
@@ -9,10 +9,11 @@ the EXIF date; the file's modified time is never used):
 
   * Outside 2006-12-18 .. 2007-05-21 (inclusive): never copied.
   * IMG_nnnn (Canon SD800):           copied for the whole range.
-  * DSC_nnnn (Nikon D70s, or the D80 bought 2007-04-02, same naming):
-                                      copied only before 2007-04-02.
-  * Any other name: EXIF Make/Model decides. Canon SD800 -> copy; Nikon D70s -> copy before
-    2007-04-02; anything else (D80, other cameras, no EXIF) -> skipped and reported.
+  * DSC_nnnn (Nikon D70s, or the D80 bought 2007-03-31, same naming):
+                                      copied only before 2007-03-31.
+  * Any other name: copied, unless the EXIF model is a Nikon D80 (skipped). Files with no
+    camera EXIF cannot be shown to be D80, so they are copied. Before 2007-03-31 the D80 can't
+    be involved, so EXIF isn't read at all.
 
 Copies are renamed to  YYYY-MM-DD-HH-MM-<rest of name>, e.g. 2007-03-29-12-52-IMG-1071-443720252.jpg
 Existing files in the destination are never overwritten.
@@ -36,7 +37,7 @@ from PIL import Image
 
 START = datetime(2006, 12, 18, 0, 0)
 END = datetime(2007, 5, 21, 23, 59, 59)
-D80_BOUGHT = datetime(2007, 4, 2, 0, 0)  # from here on DSC_ files are the D80, not wanted
+D80_FROM = datetime(2007, 3, 31, 0, 0)  # from here on DSC_ files are the D80 (not wanted) and EXIF must be checked
 
 NAME_RE = re.compile(r"^(\d\d)-(\d\d)-(\d\d)-(.+)-(\d+)\.([A-Za-z0-9]+)$")
 MONTH_RE = re.compile(r"^(\d{4})-(\d\d)$")
@@ -85,7 +86,8 @@ def decide(path, root):
     dt, rest, cam_name = parse_path(path, root)
     make = model = ""
     exif_dt = None
-    need_exif = dt is None or cam_name is None
+    # EXIF is only needed for a missing date, or to rule out the D80 on non-camera names
+    need_exif = dt is None or (cam_name is None and dt >= D80_FROM)
     if need_exif:
         make, model, exif_dt = read_exif(path)
     when = dt or exif_dt
@@ -98,20 +100,18 @@ def decide(path, root):
         prefix = cam_name[:3].upper()
         if prefix == "IMG":
             ok, reason = True, "IMG_ name (Canon)"
-        elif when < D80_BOUGHT:
+        elif when < D80_FROM:
             ok, reason = True, "DSC_ name before D80 (Nikon D70s)"
         else:
             return False, "DSC_ name after D80 bought", when, None
     else:
         low = f"{make} {model}".lower()
-        if "canon" in low and "sd800" in low:
-            ok, reason = True, f"EXIF {model}"
-        elif "d70s" in low and when < D80_BOUGHT:
-            ok, reason = True, f"EXIF {model}"
-        elif not (make or model):
-            return False, "other name, no camera EXIF", when, None
+        if "d80" in low:
+            return False, f"Nikon D80 (EXIF {model})", when, None
+        if when < D80_FROM:
+            ok, reason = True, "other name, before D80 (EXIF not checked)"
         else:
-            return False, f"other camera: {make} {model}".strip(), when, None
+            ok, reason = True, f"EXIF {model}" if model else "other name, no camera EXIF"
 
     if rest is None:  # not in flickr layout, so build the name from the file name itself
         rest = os.path.basename(path)
