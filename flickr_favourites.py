@@ -115,8 +115,9 @@ class Stream:
                     return cls(c["photos"])
             except Exception as e:
                 log(f"stream cache unreadable ({e}), rebuilding", logf)
-        # flickr.photos.search returns at most ~4000 photos per query (later pages repeat), so a
-        # big photostream is fetched in date ranges, splitting any range that is too big.
+        # flickr.photos.search caps what it returns per query (your account showed exactly 1000, the
+        # docs say ~4000) and the reported total is capped too, so fetch in date ranges and split
+        # any range that comes back with 900 or more photos.
         taken = "taken" in sort
         epoch, lo0, hi0 = datetime(1970, 1, 1), datetime(1800, 1, 1), datetime.now() + timedelta(days=2)
         if not taken:
@@ -135,7 +136,7 @@ class Stream:
                      **{f"min_{key}_date": bound(lo), f"max_{key}_date": bound(hi)})
             first = fl.call("flickr.photos.search", page=1, **q)["photos"]
             total = int(first["total"])
-            if total > 3500 and (hi - lo).total_seconds() > 2:
+            if total >= 900 and (hi - lo).total_seconds() > 2:
                 mid = lo + (hi - lo) / 2
                 fetch(lo, mid)
                 fetch(mid, hi)
