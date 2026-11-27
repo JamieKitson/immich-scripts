@@ -260,11 +260,43 @@ def finish(assets, detail, im, args):
     return "would_favourite", detail
 
 
+def resolve_files(p, targets, im, args, detail, label):
+    """Immich asset for candidate film files [(host dir, name)]: look each up by path, keep similar
+    shapes, and only answer if they are all in one folder (one roll). Reason goes in detail."""
+    film = args.film
+    if not targets:
+        detail["neighbours"] = f"{label}: no such file under {film.host}"
+        return None
+    assets = []
+    for d, fn in targets:
+        assets += im.by_path(film.container(d, fn))
+    if not assets:
+        detail["neighbours"] = f"{label}: found {len(targets)} file(s) on disk (e.g. {targets[0][1]}) but none in immich"
+        return None
+    if not args.no_ratio:
+        assets = [a for a in assets if ratio_close(flickr_size(p), asset_dims(a))]
+    folders = {os.path.dirname(a["originalPath"]) for a in assets}
+    if len(folders) != 1:
+        detail["neighbours"] = (f"{label}: {len(folders)} candidate folders: "
+                                + ", ".join(sorted(folders)[:3]))
+        return None
+    best = pick_best(assets)
+    detail["neighbours"] = f"{label}: {best['originalPath']}"
+    return best
+
+
 def via_neighbours(p, ctx, im, args, detail):
-    """Film scans whose Flickr title was changed: walk the photostream (getContext) to the nearest
-    photos whose title is still just a number, find those files by number in the film folder, and
-    work out this photo's original file name from the distance. Returns an asset or None (reason in
-    detail['neighbours'])."""
+    """Film scans with no date. Their numbers look like 71810002: roll 718100, frame 02.
+    If the Flickr title is itself such a number the file is just that name. Otherwise (the title was
+    changed) walk the photostream (getContext) to the nearest photos whose title is still a number and
+    work out this one's frame from the distance. Files are found by number in the film folder.
+    Returns an asset or None (reason in detail['neighbours'])."""
+    film = args.film
+    own = numeric_title(p)
+    if own is not None:
+        detail.update(wanted_number=own, neighbour_match="own title")
+        return resolve_files(p, film.find(own), im, args, detail, f"title {own}")
+
     pid = str(p["id"])
 
     def nearest(direction):
@@ -280,26 +312,30 @@ def via_neighbours(p, ctx, im, args, detail):
         return None
 
     before, after = nearest("prev"), nearest("next")
-    in_roll = lambda n: 1 <= n <= args.max_frame
+    in_roll = lambda f: 1 <= f <= args.max_frame
+    frame = lambda a: a[2] % 100      # last two digits: 71810002 -> 2
+    roll = lambda a: a[2] - frame(a)  # the rest:          71810002 -> 71810000
 
     def guess(anchor, is_before, order):
-        """Number this photo would have if the numbers run in `order` along the stream."""
+        """Frame this photo would have if frames run in `order` along the stream."""
         sgn = 1 if order == "asc" else -1
-        return anchor[2] + sgn * anchor[1] if is_before else anchor[2] - sgn * anchor[1]
+        return frame(anchor) + sgn * anchor[1] if is_before else frame(anchor) - sgn * anchor[1]
 
     chosen = None   # (wanted number, order, anchor ids, how)
     if before and after:
-        for order in ("asc", "desc"):
-            w1, w2 = guess(before, True, order), guess(after, False, order)
-            if w1 == w2 and in_roll(w1):
-                chosen = (w1, order, [before[0], after[0]], "both agree")
-                break
+        if roll(before) == roll(after):
+            for order in ("asc", "desc"):
+                w1, w2 = guess(before, True, order), guess(after, False, order)
+                if w1 == w2 and in_roll(w1):
+                    chosen = (roll(before) + w1, order, [before[0], after[0]], "both agree")
+                    break
         if chosen is None:
-            # The two don't line up (gaps, or a roll boundary between them). Take the direction from
-            # the numbers themselves and trust the closer anchor, skipping any answer outside a roll.
-            order = "asc" if before[2] < after[2] else "desc" if before[2] > after[2] else args.scan_order
+            # They don't line up (gaps, or a roll boundary between them). Take the direction from the
+            # numbers themselves and trust the closer anchor, skipping any frame outside a roll.
+            order = ("asc" if before[2] < after[2] else "desc" if before[2] > after[2]
+                     else args.scan_order)
             near = sorted([(before[1], True, before), (after[1], False, after)], key=lambda x: x[0])
-            opts = [(d, guess(a, b, order), a) for d, b, a in near if in_roll(guess(a, b, order))]
+            opts = [(d, roll(a) + guess(a, b, order), a) for d, b, a in near if in_roll(guess(a, b, order))]
             if len(opts) == 2 and opts[0][0] == opts[1][0] and opts[0][1] != opts[1][1]:
                 detail["neighbours"] = (f"{ctx.title(before[0])} (-{before[1]}) and {ctx.title(after[0])} "
                                         f"(+{after[1]}) disagree and are equally close")
@@ -314,21 +350,21 @@ def via_neighbours(p, ctx, im, args, detail):
         a, is_before = (before, True) if before else (after, False)
         ok_orders = [o for o in (args.scan_order, "desc" if args.scan_order == "asc" else "asc")
                      if in_roll(guess(a, is_before, o))]
-        if ok_orders:   # numbers outside a roll rule an order out; if both fit, use --scan-order
-            chosen = (guess(a, is_before, ok_orders[0]), ok_orders[0], [a[0]], "one side only")
+        if ok_orders:   # a frame outside a roll rules an order out; if both fit, use --scan-order
+            chosen = (roll(a) + guess(a, is_before, ok_orders[0]), ok_orders[0], [a[0]], "one side only")
     else:
         detail["neighbours"] = f"no numeric title within {args.neighbour_steps} photos either way"
         return None
     if chosen is None:
-        detail["neighbours"] = f"every number worked out from the neighbours is outside 1-{args.max_frame}"
+        detail["neighbours"] = (f"every frame worked out from the neighbours is outside 1-{args.max_frame} "
+                                f"(neighbours {before and ctx.title(before[0])} -{before and before[1]}, "
+                                f"{after and ctx.title(after[0])} +{after and after[1]})")
         return None
     wanted, order, anchors, how = chosen
     detail.update(wanted_number=wanted, scan_order=order, anchors=anchors, neighbour_match=how)
 
-    film = args.film
     names = [ctx.title(a) for a in anchors]
-    # The scans have no date, so find them by number in the film folder. The anchors used must be in
-    # the same folder (one roll); the wanted number must be in that folder too.
+    # The anchors used must be in the same folder (one roll); the wanted file must be in it too.
     dirs = None
     for aid in anchors:
         ds = {d for d, _ in film.find(numeric_title({"title": ctx.title(aid)}))}
@@ -337,25 +373,7 @@ def via_neighbours(p, ctx, im, args, detail):
         detail["neighbours"] = f"no folder under {film.host} contains {' and '.join(names)}"
         return None
     targets = [(d, fn) for d, fn in film.find(wanted) if d in dirs]
-    if not targets:
-        detail["neighbours"] = f"{wanted} not found in the {len(dirs)} folder(s) holding {' and '.join(names)}"
-        return None
-    assets = []
-    for d, fn in targets:
-        assets += im.by_path(film.container(d, fn))
-    if not assets:
-        detail["neighbours"] = f"found {len(targets)} file(s) on disk (e.g. {targets[0][1]}) but none in immich"
-        return None
-    if not args.no_ratio:
-        assets = [a for a in assets if ratio_close(flickr_size(p), asset_dims(a))] or []
-    folders = {os.path.dirname(a["originalPath"]) for a in assets}
-    if len(folders) != 1:
-        detail["neighbours"] = (f"{len(folders)} candidate folders for {wanted}: "
-                                + ", ".join(sorted(folders)[:3]))
-        return None
-    best = pick_best(assets)
-    detail["neighbours"] = f"from {' and '.join(names)}: {best['originalPath']}"
-    return best
+    return resolve_files(p, targets, im, args, detail, f"from {' and '.join(names)} -> {wanted}")
 
 
 def process(p, im, backup, ctx, args):

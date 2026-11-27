@@ -107,17 +107,22 @@ For each tagged photo it:
    with that name. Anything still tied is resolved with `--ties` (default `pick`).
 4. Favourites the asset (only with `--apply`).
 
-**Renamed film scans.** Only for photos with no date taken (Flickr's `datetakenunknown`, typical of
-scans; they skip the time search, since Flickr's date would just be the upload time), the script walks outwards through your photostream
-with `flickr.photos.getContext` (previous/next photo, one API call per step) to the nearest photos
-whose title is still just a number. Scans have no date, so it finds those files by number under
-`--film-root` (default `/btsync/backup/Film`; `--film-container` is the same folder as Immich sees it,
-default `/external/older/backup/Film`), walked once per run. The distance gives the number for this photo:
-with `0010` one step before and `0013` two steps after, the photo is `0011`. Both neighbours must be in
-the same folder (one roll), and the wanted file is looked up in Immich by its path there, so a number that
-exists in several rolls is only used if the folder is unambiguous. Whether numbers rise or fall along the stream is worked out from the neighbours. If both agree, that
+**Film scans.** Only for photos with no date taken (Flickr's `datetakenunknown`, typical of scans; they
+skip the time search, since Flickr's date would just be the upload time). Scan numbers look like
+`71810002`: roll `718100`, frame `02` (the last two digits). Files are found by number under `--film-root`
+(default `/btsync/backup/Film`; `--film-container` is the same folder as Immich sees it, default
+`/external/older/backup/Film`), walked once per run, and looked up in Immich by path.
+
+- If the Flickr title is itself a number, that is the file name, and no neighbours are needed.
+- Otherwise the title was changed, so the script walks outwards through your photostream with
+  `flickr.photos.getContext` (previous/next photo, one API call per step) to the nearest photos whose
+  title is still a number. The distance gives the frame: with `...0002` one step before and `...0004`
+  one step after, the photo is `...0003`. Both neighbours must be in the same folder (one roll), and a
+  number that exists in several rolls is only used if the folder is unambiguous.
+
+Whether numbers rise or fall along the stream is worked out from the neighbours. If both agree, that
 is the answer. If they don't (gaps, or a roll boundary between them), the closer one is used, with the
-direction taken from the two numbers; equally close and disagreeing is left alone. Any number outside
+direction taken from the two numbers; equally close and disagreeing is left alone. Any frame outside
 1 to `--max-frame` (default 40) is ruled out, so for example `0001` can only count upwards. `--one-sided`
 accepts a single neighbour, using `--scan-order` if both directions fit in a roll. The result is logged as `neighbours` in the state file. Everything fetched is cached
 in `flickr-context.json` (delete it if you reorder your photostream), so neighbouring photos in a roll
