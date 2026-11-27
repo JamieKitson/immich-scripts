@@ -9,12 +9,21 @@ In that range:
   * IMG-YYYYMMDD-HHMMSS   (P9 camera, e.g. 14-11-09-IMG-20170514-110903-34561553701.jpg)  -> copy
   * IMG-YYYYMMDD-WAnnnn   (WhatsApp)                                                       -> skip
   * Gruffalo-...          (e.g. 23-15-20-Gruffalo-03-20-39-23-04-17-33437788844.png)       -> copy
-  * VID-...               none expected                                                    -> WARNING, skipped
+  * VID-...               none expected                                                    -> WARNING (the .jpg is a
+                          stand-in for a video; the last number is its Flickr ID). With --download-videos
+                          the original video is fetched via the Flickr API (see below).
   * anything else                                                                          -> skipped, logged
 
 Copies are renamed to  YYYY-MM-DD-HH-MM-<rest of name>. Existing files in the destination are never
 overwritten. Dry run unless --apply is given. Keep this next to flickr_recover.py (it shares the
 filename pattern).
+
+--download-videos: for each VID stand-in, asks Flickr (flickr.photos.getSizes / getInfo) for the
+original video and saves it as YYYY-MM-DD-HH-MM-VID-...-<id>.<ext> in --dest. The API lookup also
+happens in a dry run (it is read-only), so a dry run shows whether originals are available to you,
+or which sizes Flickr offers instead. Transcoded copies (HD/Site/Mobile MP4) are only used with
+--allow-transcoded. Needs  pip install requests requests-oauthlib  and, as for flickr_favourites.py,
+FLICKR_API_KEY, FLICKR_API_SECRET, FLICKR_OAUTH_TOKEN, FLICKR_OAUTH_SECRET (see flickr_auth.py).
 
     ./flickr_recover_p9.py --dest /path/to/library/recovered            # dry run
     ./flickr_recover_p9.py --dest /path/to/library/recovered --apply
@@ -66,11 +75,98 @@ def decide(path):
     return "copy", reason, when, f"{when:%Y-%m-%d-%H-%M}-{title}-{fid}.{ext}"
 
 
+ID_RE = re.compile(r"-(\d+)\.[A-Za-z0-9]+$")
+VIDEO_EXT = {"video/quicktime": "mov", "video/mp4": "mp4", "video/x-msvideo": "avi",
+             "video/x-m4v": "m4v", "video/3gpp": "3gp"}
+TRANSCODED = ["HD MP4", "Site MP4", "Mobile MP4"]
+
+
+def flickr_client():
+    import flickr_favourites  # lazy: pulls in requests/pillow only when videos are wanted
+    env = os.environ
+    need = ["FLICKR_API_KEY", "FLICKR_API_SECRET", "FLICKR_OAUTH_TOKEN", "FLICKR_OAUTH_SECRET"]
+    missing = [k for k in need if not env.get(k)]
+    if missing:
+        sys.exit("--download-videos needs these environment variables: " + ", ".join(missing))
+    return flickr_favourites.Flickr(env["FLICKR_API_KEY"], env["FLICKR_API_SECRET"],
+                                    env["FLICKR_OAUTH_TOKEN"], env["FLICKR_OAUTH_SECRET"])
+
+
+def video_candidates(fl, pid, allow_transcoded):
+    """Return (list of (label, url, ext|None), note). Original first; note says what Flickr offers."""
+    sizes = {x["label"]: x for x in fl.call("flickr.photos.getSizes", photo_id=pid)["sizes"]["size"]}
+    cands = []
+    if "Video Original" in sizes:
+        cands.append(("Video Original", sizes["Video Original"]["source"], None))
+    try:
+        info = fl.call("flickr.photos.getInfo", photo_id=pid)["photo"]
+        sec, fmt, owner = info.get("originalsecret"), info.get("originalformat"), info["owner"]["nsid"]
+        if sec and info.get("media") == "video":
+            cands.append(("play/orig", f"https://www.flickr.com/photos/{owner}/{pid}/play/orig/{sec}/", fmt))
+    except Exception:
+        pass
+    if allow_transcoded:
+        cands += [(l, sizes[l]["source"], "mp4") for l in TRANSCODED if l in sizes]
+    return cands, "flickr offers: " + ", ".join(sizes)
+
+
+def download(fl, url, dest_base, ext):
+    """Download url to dest_base.<ext>; returns the final path, or None if Flickr served a web page."""
+    import requests
+    for session in (requests, fl.s):  # try unauthenticated, then OAuth-signed
+        try:
+            r = session.get(url, stream=True, allow_redirects=True, timeout=120)
+        except requests.RequestException:
+            continue
+        ctype = r.headers.get("content-type", "").split(";")[0].strip().lower()
+        if r.status_code != 200 or ctype.startswith("text/") or "json" in ctype:
+            r.close()
+            continue
+        path = f"{dest_base}.{ext or VIDEO_EXT.get(ctype, 'mp4')}"
+        if os.path.exists(path):
+            r.close()
+            return path, True
+        with open(path + ".part", "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+        os.replace(path + ".part", path)
+        return path, False
+    return None, False
+
+
+def handle_video(fl, pid, path, when, args):
+    """Try to get the original video for a VID stand-in. Returns (status, reason, destination)."""
+    title_id = os.path.basename(path)[9:].rsplit(".", 1)[0]  # strip DD-HH-MM-, extension
+    base = os.path.join(args.dest, f"{when:%Y-%m-%d-%H-%M}-{title_id}")
+    try:
+        cands, note = video_candidates(fl, pid, args.allow_transcoded)
+        if not cands:
+            print(f"  video {pid}: no original available ({note})")
+            return "video_unavailable", note, ""
+        if not args.apply:
+            print(f"  video {pid}: would download {cands[0][0]}")
+            return "would_download_video", cands[0][0], base
+        for label, url, ext in cands:
+            got, existed = download(fl, url, base, ext)
+            if got:
+                print(f"  video {pid}: {'already there' if existed else 'downloaded'} {label} -> {got}")
+                return ("exists" if existed else "video_downloaded"), label, got
+        print(f"  video {pid}: download failed for all of {[c[0] for c in cands]} ({note})")
+        return "video_unavailable", f"download refused; {note}", ""
+    except Exception as e:
+        print(f"  video {pid}: error {e}")
+        return "error", str(e), ""
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--flickr-root", default="/mnt/disk/flickrBackup/jamie/", help="Flickr backup directory")
     ap.add_argument("--dest", required=True, help="Directory to copy the recovered files into")
     ap.add_argument("--apply", action="store_true", help="Actually copy (default is a dry run)")
+    ap.add_argument("--download-videos", action="store_true",
+                    help="Fetch the original video for each VID stand-in from the Flickr API")
+    ap.add_argument("--allow-transcoded", action="store_true",
+                    help="With --download-videos, accept Flickr's HD/Site/Mobile MP4 if no original is available")
     ap.add_argument("--report", default="flickr-recover-p9.csv", help="CSV log of every decision")
     args = ap.parse_args()
 
@@ -87,6 +183,7 @@ def main():
 
     if args.apply:
         os.makedirs(args.dest, exist_ok=True)
+    fl = flickr_client() if args.download_videos else None
 
     stats = Counter()
     with open(args.report, "w", newline="", encoding="utf-8") as fh:
@@ -107,6 +204,9 @@ def main():
             elif decision == "warn":
                 status = "warning"
                 print(f"WARNING: {reason}: {path}")
+                im = ID_RE.search(path)
+                if fl and im:
+                    status, reason, dest = handle_video(fl, im[1], path, when, args)
             else:
                 status = "skipped"
             stats[status if status != "skipped" else f"skipped: {reason}"] += 1
