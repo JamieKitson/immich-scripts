@@ -107,7 +107,8 @@ For each tagged photo it:
    with that name. Anything still tied is resolved with `--ties` (default `pick`).
 4. Favourites the asset (only with `--apply`).
 
-**Renamed film scans.** If steps 1-3 find nothing, the script walks outwards through your photostream
+**Renamed film scans.** Only for photos with no date taken (Flickr's `datetakenunknown`, typical of
+scans; they skip the time search, since Flickr's date would just be the upload time), the script walks outwards through your photostream
 with `flickr.photos.getContext` (previous/next photo, one API call per step) to the nearest photos
 whose title is still just a number. It finds those in Immich by time and checks that their file
 names are that number. The distance gives the number for this photo: with `0010` one step before and
@@ -116,7 +117,7 @@ neighbour. Whether numbers rise or fall along the stream is worked out from the 
 must agree (this also checks the stream order). `--one-sided` accepts a single neighbour, using
 `--scan-order`. The result is logged as `neighbours` in the state file. Everything fetched is cached
 in `flickr-context.json` (delete it if you reorder your photostream), so neighbouring photos in a roll
-share their walks. Other options: `--neighbour-steps` (default 50), `--no-neighbours`.
+share their walks. Other options: `--neighbour-steps` (default 5, since a roll is at most 38 frames and few are public and titled), `--no-neighbours`.
 
 (Downloading the whole photostream instead is a poor fit: `flickr.photos.search` caps each query, so
 it would need many date-range queries for a library of 70k photos.)

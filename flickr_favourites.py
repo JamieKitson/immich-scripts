@@ -318,10 +318,16 @@ def process(p, im, backup, ctx, args):
     not_found/ambiguous/no_date/error."""
     title = p.get("title", "")
     detail = {"title": title}
-    items = candidates_by_time(p, im, backup, args, detail)
-    if items is None:
-        detail["note"] = "no usable date from flickr or the backup"
-    elif items:
+    if str(p.get("datetakenunknown", "0")) == "1":
+        # No date taken (no EXIF date): typical of film scans. Flickr's date would only be the upload
+        # time, so don't search by time; the photostream neighbours are the only clue.
+        items = None
+        detail["note"] = "flickr has no date taken"
+    else:
+        items = candidates_by_time(p, im, backup, args, detail)
+        if items is None:
+            detail["note"] = "no usable date from flickr or the backup"
+    if items:
         if len(items) > 1 and norm(title):
             named = [a for a in items if norm(a.get("originalFileName")) == norm(title)]
             if named:
@@ -332,7 +338,9 @@ def process(p, im, backup, ctx, args):
         asset, res = resolve_tie(items, args, detail, f"{len(items)} immich assets at that time")
         return res if res else finish(asset if isinstance(asset, list) else [asset], detail, im, args)
 
-    if ctx is not None:
+    # Neighbours are only for photos with no usable date taken. If there was a date, the time
+    # search is authoritative: the photo isn't a roll-sequence scan, so don't guess from neighbours.
+    if ctx is not None and items is None:
         asset = via_neighbours(p, ctx, im, backup, args, detail)
         if asset:
             detail["time_from"] = "photostream neighbours"
@@ -365,7 +373,7 @@ def main():
                     help="don't try to work out renamed film scans from neighbouring photos")
     ap.add_argument("--scan-order", choices=["asc", "desc"], default="asc",
                     help="do scan numbers increase (asc) or decrease along the stream order?")
-    ap.add_argument("--neighbour-steps", type=int, default=50,
+    ap.add_argument("--neighbour-steps", type=int, default=5,
                     help="how far to walk to find a photo whose title is just a number")
     ap.add_argument("--one-sided", action="store_true",
                     help="accept a guess from a numeric neighbour on one side only (default needs both "
