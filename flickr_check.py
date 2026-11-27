@@ -15,9 +15,15 @@ Within each minute, Flickr photos are paired with Immich assets, strongest evide
   found_dims   same pixel dimensions (either orientation)
   weak         only the time (and a compatible shape / media type) matches: a burst could be
                hiding a missing photo, so check these by eye
-  name_only    nothing at that time, but Immich has a file with the same name and dimensions
-               (typical of early photos whose EXIF date is missing or wrong); its date is logged
-  missing      none of the above
+  name_only    no match at that time, the backup file has no EXIF date taken, and Immich has exactly
+               one file with the same name (its date is logged); counted as found
+  undated_missing  no match at that time, the backup file has no EXIF date taken, and Immich has
+               no file, or more than one file, with that name
+  missing      no match at that time and the backup file does have an EXIF date taken, so it
+               should have matched by time
+
+Only photos still unmatched after the time pass have their EXIF read (the drive is slow); the
+result is cached in flickr-exif.json.
 
 Each Immich asset is used for at most one Flickr photo, so a burst of 5 in Flickr and 3 in
 Immich shows 2 missing. Results go to a CSV; nothing is written to Immich or the backup.
@@ -44,7 +50,7 @@ from immich_favourites import FlickrIndex, Immich, iso, log, ratio_close
 NAME_RE = re.compile(r"^(\d\d)-(\d\d)-(\d\d)-(.+)-(\d+)\.([A-Za-z0-9]+)$")
 MONTH_RE = re.compile(r"^(\d{4})-(\d\d)$")
 VIDEO_EXT = {"mov", "mp4", "avi", "m4v", "3gp", "mpg", "mpeg", "wmv", "mts", "mkv", "webm"}
-STATUSES = ["found_name", "found_dims", "weak", "name_only", "missing"]
+STATUSES = ["found_name", "found_dims", "weak", "name_only", "undated_missing", "missing"]
 
 
 def norm(name):
@@ -114,6 +120,40 @@ class Dims:
             self.dirty = True
         v = self.cache[f["path"]]
         return tuple(v) if v else None
+
+    def save(self):
+        if self.dirty:
+            with open(self.path, "w") as f:
+                json.dump(self.cache, f)
+
+
+class ExifDates:
+    """EXIF date taken of backup files ("" if none), read lazily and cached (slow drive)."""
+
+    def __init__(self, path):
+        self.path, self.cache, self.dirty = path, {}, False
+        try:
+            with open(path) as f:
+                self.cache = json.load(f)
+        except Exception:
+            pass
+
+    def get(self, f):
+        if f["path"] not in self.cache:
+            date = ""
+            try:
+                with Image.open(f["path"]) as im:
+                    ex = im.getexif()
+                    date = (ex.get_ifd(0x8769).get(36867) or ex.get_ifd(0x8769).get(36868)
+                            or "")
+                    date = str(date).strip().strip("\x00").strip()
+                    if date.startswith("0000"):
+                        date = ""
+            except Exception:
+                date = ""  # unreadable or not an image (e.g. video): no EXIF date
+            self.cache[f["path"]] = date
+            self.dirty = True
+        return self.cache[f["path"]]
 
     def save(self):
         if self.dirty:
@@ -210,8 +250,8 @@ def match_minute(items, avail, dims):
     return [out.get(id(f), (f, None, "missing")) for f in items]
 
 
-def name_lookup(im, f, dims):
-    """Immich assets with the Flickr photo's original name and dimensions, whatever their date."""
+def name_lookup(im, f):
+    """Immich assets with the Flickr photo's original name, whatever their date."""
     title = f["title"]
     variants = {title, re.sub(r"-(\d+)$", r"_\1", title), title.replace("-", "_")}
     seen = {}
@@ -222,8 +262,7 @@ def name_lookup(im, f, dims):
                     seen[a["id"]] = slim(a)
         except Exception as e:
             log(f"name lookup failed for {v!r}: {e}")
-    d = dims(f)
-    return [a for a in seen.values() if same_dims(d, asset_dims(a))]
+    return list(seen.values())
 
 
 # ---------------------------------------------------------------- main
@@ -243,8 +282,9 @@ def main():
     ap.add_argument("--immich-cache", default="immich-assets.json")
     ap.add_argument("--refetch", action="store_true", help="Download the Immich metadata again")
     ap.add_argument("--no-name-fallback", action="store_true",
-                    help="Skip the by-file-name Immich search for photos with no match by time")
+                    help="Skip the by-file-name Immich search for undated photos with no match by time")
     ap.add_argument("--dims-cache", default="flickr-dims.json")
+    ap.add_argument("--exif-cache", default="flickr-exif.json")
     ap.add_argument("--report", default="flickr-check.csv", help="CSV of every Flickr photo and its result")
     args = ap.parse_args()
 
@@ -279,6 +319,7 @@ def main():
         lst.sort(key=lambda a: a["path"] or "")
 
     dims = Dims(args.dims_cache)
+    exif = ExifDates(args.exif_cache)
     groups = defaultdict(list)
     for f in flickr:
         groups[f["minute"]].append(f)
@@ -290,25 +331,39 @@ def main():
         stats = Counter(r[2] for r in results)
         log("matched by time: " + ", ".join(f"{stats[s]} {s}" for s in STATUSES))
 
+        todo = [i for i, r in enumerate(results) if r[2] == "missing"]
+        log(f"checking EXIF date taken of the {len(todo)} unmatched photos ...")
+        undated = []
+        for n, i in enumerate(todo, 1):
+            f = results[i][0]
+            if exif.get(f):
+                continue  # has a date taken but nothing matched at that time: missing
+            results[i] = (f, None, "undated_missing")
+            undated.append(i)
+            if n % 50 == 0:
+                log(f"  {n}/{len(todo)}")
+        log(f"{len(todo) - len(undated)} missing (dated), {len(undated)} without an EXIF date")
+
         if not args.no_name_fallback:
-            todo = [i for i, r in enumerate(results) if r[2] == "missing"]
-            log(f"searching Immich by file name for the {len(todo)} unmatched photos ...")
-            for n, i in enumerate(todo, 1):
+            log(f"searching Immich by file name for the {len(undated)} undated photos ...")
+            for n, i in enumerate(undated, 1):
                 f = results[i][0]
-                hits = name_lookup(im, f, dims.get)
-                if hits:
+                hits = name_lookup(im, f)
+                if len(hits) == 1:
                     results[i] = (f, hits[0], "name_only")
                 if n % 50 == 0:
-                    log(f"  {n}/{len(todo)}")
+                    log(f"  {n}/{len(undated)}")
     finally:
         dims.save()
+        exif.save()
 
     with open(args.report, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["status", "flickr_time", "title", "flickr_id", "flickr_path",
+        w.writerow(["status", "flickr_time", "title", "flickr_id", "flickr_path", "exif_date",
                     "asset_time", "asset_name", "asset_path", "asset_link"])
         for f, a, status in results:
             w.writerow([status, f"{f['minute']:%Y-%m-%d %H:%M}", f["title"], f["fid"], f["path"],
+                        exif.cache.get(f["path"], ""),
                         a["local"] if a else "", a["name"] if a else "", a["path"] if a else "",
                         f"{web}/photos/{a['id']}" if a else ""])
 
@@ -321,7 +376,7 @@ def main():
         print(f"{y:>6} {sum(c.values()):>7} " + " ".join(f"{c[s]:>10}" for s in STATUSES))
     tot = Counter(r[2] for r in results)
     print(f"{'all':>6} {len(results):>7} " + " ".join(f"{tot[s]:>10}" for s in STATUSES))
-    print(f"\nFull log: {args.report}  (filter status=missing; review weak and name_only by eye)")
+    print(f"\nFull log: {args.report}  (filter status=missing and undated_missing; review weak and name_only by eye)")
 
 
 if __name__ == "__main__":
