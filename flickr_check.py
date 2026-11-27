@@ -25,6 +25,9 @@ Within each minute, Flickr photos are paired with Immich assets, strongest evide
 Only photos still unmatched after the time pass have their EXIF read (the drive is slow); the
 result is cached in flickr-exif.json.
 
+The CSV is written minute by minute as the script goes. Rerunning continues after the photos
+already in it (--restart starts over), so stopping early loses nothing.
+
 Each Immich asset is used for at most one Flickr photo, so a burst of 5 in Flickr and 3 in
 Immich shows 2 missing. Results go to a CSV; nothing is written to Immich or the backup.
 
@@ -51,6 +54,8 @@ NAME_RE = re.compile(r"^(\d\d)-(\d\d)-(\d\d)-(.+)-(\d+)\.([A-Za-z0-9]+)$")
 MONTH_RE = re.compile(r"^(\d{4})-(\d\d)$")
 VIDEO_EXT = {"mov", "mp4", "avi", "m4v", "3gp", "mpg", "mpeg", "wmv", "mts", "mkv", "webm"}
 STATUSES = ["found_name", "found_dims", "weak", "name_only", "undated_missing", "missing"]
+COLUMNS = ["status", "flickr_time", "title", "flickr_id", "flickr_path", "exif_date",
+           "asset_time", "asset_name", "asset_path", "asset_link"]
 
 
 def norm(name):
@@ -285,7 +290,10 @@ def main():
                     help="Skip the by-file-name Immich search for undated photos with no match by time")
     ap.add_argument("--dims-cache", default="flickr-dims.json")
     ap.add_argument("--exif-cache", default="flickr-exif.json")
-    ap.add_argument("--report", default="flickr-check.csv", help="CSV of every Flickr photo and its result")
+    ap.add_argument("--report", default="flickr-check.csv",
+                    help="CSV of every Flickr photo and its result; rows are written as it goes and "
+                         "photos already in it are skipped, so a rerun continues where it stopped")
+    ap.add_argument("--restart", action="store_true", help="Overwrite the report and start from scratch")
     args = ap.parse_args()
 
     if not args.api_key:
@@ -324,58 +332,70 @@ def main():
     for f in flickr:
         groups[f["minute"]].append(f)
 
-    results = []
-    try:
-        for minute, items in groups.items():
-            results += match_minute(items, by_min.get(minute, []), dims.get)
-        stats = Counter(r[2] for r in results)
-        log("matched by time: " + ", ".join(f"{stats[s]} {s}" for s in STATUSES))
+    # Resume: photos already in the report are skipped, and their assets are not offered again.
+    done_paths, done_assets = set(), set()
+    if os.path.exists(args.report) and not args.restart:
+        with open(args.report, newline="", encoding="utf-8") as fh:
+            rd = csv.DictReader(fh)
+            if rd.fieldnames != COLUMNS:
+                sys.exit(f"{args.report} has different columns (older version?): move it aside "
+                         f"or pass --restart to overwrite it")
+            for row in rd:
+                if row["flickr_path"]:
+                    done_paths.add(row["flickr_path"])
+                if row["asset_link"]:
+                    done_assets.add(row["asset_link"].rsplit("/", 1)[-1])
+    new_file = args.restart or not os.path.exists(args.report) or os.path.getsize(args.report) == 0
+    todo_n = sum(1 for f in flickr if f["path"] not in done_paths)
+    log(f"{len(done_paths)} photos already in {args.report}, {todo_n} to do")
 
-        todo = [i for i, r in enumerate(results) if r[2] == "missing"]
-        log(f"checking EXIF date taken of the {len(todo)} unmatched photos ...")
-        undated = []
-        for n, i in enumerate(todo, 1):
-            f = results[i][0]
-            if exif.get(f):
-                continue  # has a date taken but nothing matched at that time: missing
-            results[i] = (f, None, "undated_missing")
-            undated.append(i)
-            if n % 50 == 0:
-                log(f"  {n}/{len(todo)}")
-        log(f"{len(todo) - len(undated)} missing (dated), {len(undated)} without an EXIF date")
-
-        if not args.no_name_fallback:
-            log(f"searching Immich by file name for the {len(undated)} undated photos ...")
-            for n, i in enumerate(undated, 1):
-                f = results[i][0]
-                hits = name_lookup(im, f)
-                if len(hits) == 1:
-                    results[i] = (f, hits[0], "name_only")
-                if n % 50 == 0:
-                    log(f"  {n}/{len(undated)}")
-    finally:
-        dims.save()
-        exif.save()
-
-    with open(args.report, "w", newline="", encoding="utf-8") as fh:
+    written = 0
+    with open(args.report, "w" if new_file else "a", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["status", "flickr_time", "title", "flickr_id", "flickr_path", "exif_date",
-                    "asset_time", "asset_name", "asset_path", "asset_link"])
-        for f, a, status in results:
-            w.writerow([status, f"{f['minute']:%Y-%m-%d %H:%M}", f["title"], f["fid"], f["path"],
-                        exif.cache.get(f["path"], ""),
-                        a["local"] if a else "", a["name"] if a else "", a["path"] if a else "",
-                        f"{web}/photos/{a['id']}" if a else ""])
+        if new_file:
+            w.writerow(COLUMNS)
+            fh.flush()
+        try:
+            for minute, items in groups.items():
+                items = [f for f in items if f["path"] not in done_paths]
+                if not items:
+                    continue
+                avail = [a for a in by_min.get(minute, []) if a["id"] not in done_assets]
+                res = match_minute(items, avail, dims.get)
+                for i, (f, a, status) in enumerate(res):
+                    if status != "missing" or exif.get(f):
+                        continue  # matched, or has a date taken but nothing matched: missing
+                    status = "undated_missing"
+                    if not args.no_name_fallback:
+                        hits = name_lookup(im, f)
+                        if len(hits) == 1:
+                            a, status = hits[0], "name_only"
+                    res[i] = (f, a, status)
+                for f, a, status in res:
+                    w.writerow([status, f"{f['minute']:%Y-%m-%d %H:%M}", f["title"], f["fid"], f["path"],
+                                exif.cache.get(f["path"], ""),
+                                a["local"] if a else "", a["name"] if a else "", a["path"] if a else "",
+                                f"{web}/photos/{a['id']}" if a else ""])
+                fh.flush()
+                before, written = written, written + len(res)
+                if before // 500 != written // 500:
+                    log(f"  {written}/{todo_n} done, at {minute:%Y-%m-%d}")
+        except KeyboardInterrupt:
+            log(f"interrupted after {written} photos; run again to continue from there")
+        finally:
+            dims.save()
+            exif.save()
 
-    per_year = defaultdict(Counter)
-    for f, _a, status in results:
-        per_year[f["minute"].year][status] += 1
-    print(f"\n{'year':>6} {'total':>7} " + " ".join(f"{s:>10}" for s in STATUSES))
+    per_year, tot = defaultdict(Counter), Counter()
+    with open(args.report, newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            per_year[row["flickr_time"][:4]][row["status"]] += 1
+            tot[row["status"]] += 1
+    print(f"\n{'year':>6} {'total':>7} " + " ".join(f"{s:>15}" for s in STATUSES))
     for y in sorted(per_year):
         c = per_year[y]
-        print(f"{y:>6} {sum(c.values()):>7} " + " ".join(f"{c[s]:>10}" for s in STATUSES))
-    tot = Counter(r[2] for r in results)
-    print(f"{'all':>6} {len(results):>7} " + " ".join(f"{tot[s]:>10}" for s in STATUSES))
+        print(f"{y:>6} {sum(c.values()):>7} " + " ".join(f"{c[s]:>15}" for s in STATUSES))
+    print(f"{'all':>6} {sum(tot.values()):>7} " + " ".join(f"{tot[s]:>15}" for s in STATUSES))
     print(f"\nFull log: {args.report}  (filter status=missing and undated_missing; review weak and name_only by eye)")
 
 
