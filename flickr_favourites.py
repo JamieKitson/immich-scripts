@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-from immich_favourites import (FlickrIndex, Immich, close, log, pick_best,  # noqa: F401
+from immich_favourites import (RAW_EXT, FlickrIndex, Immich, close, log, pick_best,  # noqa: F401
                                ratio_close, resolve_tie)
 
 API = "https://api.flickr.com/services/rest/"
@@ -128,17 +128,32 @@ class Context:
     def title(self, pid):
         return self.d["titles"].get(pid, "")
 
-    def info(self, pid):
-        """Photo dict (id, title, date fields) for a neighbour, from flickr.photos.getInfo."""
-        i = self.d["info"].get(pid)
-        if i is None:
-            ph = self.fl.call("flickr.photos.getInfo", photo_id=pid)["photo"]
-            dt = ph.get("dates") or {}
-            i = {"id": pid, "title": self.title(pid) or (ph.get("title") or {}).get("_content", ""),
-                 "datetaken": dt.get("taken"), "datetakengranularity": dt.get("takengranularity"),
-                 "datetakenunknown": dt.get("takenunknown")}
-            self.d["info"][pid] = i
-        return i
+
+class FilmIndex:
+    """Numbered scan files (0010.jpg, ...) under the film folder, by number. Walked lazily, once."""
+
+    EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".heic"} | RAW_EXT
+
+    def __init__(self, host, container, logf):
+        self.host, self.container_root, self.logf = os.path.normpath(host), container.rstrip("/"), logf
+        self.by_num = None
+
+    def find(self, n):
+        """[(host dir, file name)] of every image file whose name is the number n."""
+        if self.by_num is None:
+            t0, self.by_num, count = time.time(), {}, 0
+            for dp, _dn, fns in os.walk(self.host, onerror=lambda e: log(f"walk error: {e}", self.logf)):
+                for fn in fns:
+                    stem, ext = os.path.splitext(fn)
+                    if stem.isdigit() and ext.lower() in self.EXTS:
+                        self.by_num.setdefault(int(stem), []).append((dp, fn))
+                        count += 1
+            log(f"film index: {count} numbered files under {self.host} in {time.time() - t0:.0f}s", self.logf)
+        return self.by_num.get(n, [])
+
+    def container(self, host_dir, fn):
+        rel = os.path.relpath(os.path.join(host_dir, fn), self.host)
+        return self.container_root + "/" + rel.replace(os.sep, "/")
 
 
 def numeric_title(p):
@@ -245,10 +260,10 @@ def finish(assets, detail, im, args):
     return "would_favourite", detail
 
 
-def via_neighbours(p, ctx, im, backup, args, detail):
+def via_neighbours(p, ctx, im, args, detail):
     """Film scans whose Flickr title was changed: walk the photostream (getContext) to the nearest
-    photos whose title is still just a number, find those in Immich by time, and work out this
-    photo's original file name from the distance. Returns an asset or None (reason in
+    photos whose title is still just a number, find those files by number in the film folder, and
+    work out this photo's original file name from the distance. Returns an asset or None (reason in
     detail['neighbours'])."""
     pid = str(p["id"])
 
@@ -289,28 +304,37 @@ def via_neighbours(p, ctx, im, backup, args, detail):
         return None
     detail.update(wanted_number=wanted, scan_order=order, anchors=anchors)
 
+    film = args.film
+    names = [ctx.title(a) for a in anchors]
+    # The scans have no date, so find them by number in the film folder. Both anchors must be in the
+    # same folder (one roll); the wanted number must be in that folder too.
+    dirs = None
     for aid in anchors:
-        q = ctx.info(aid)
-        qn = numeric_title(q)
-        cands = candidates_by_time(q, im, backup, args, {}) or []
-        found = [a for a in cands
-                 if re.fullmatch(r"\d+", os.path.splitext(a.get("originalFileName") or "")[0])
-                 and int(os.path.splitext(a["originalFileName"])[0]) == qn]
-        if len(found) != 1:
-            detail["neighbours"] = f"anchor {q['title']} ({aid}) matched {len(found)} immich assets"
-            continue
-        stem, ext = os.path.splitext(found[0]["originalFileName"])
-        path = os.path.dirname(found[0]["originalPath"]) + "/" + str(wanted).zfill(len(stem)) + ext
-        target = im.by_path(path)
-        if not target:
-            detail["neighbours"] = f"worked out {path} but it is not in immich"
-            continue
-        if not args.no_ratio and not ratio_close(flickr_size(p), asset_dims(target[0])):
-            detail["neighbours"] = f"{path} found but its shape differs from the flickr photo"
-            continue
-        detail["neighbours"] = f"from {q['title']} ({aid}): {path}"
-        return target[0]
-    return None
+        ds = {d for d, _ in film.find(numeric_title({"title": ctx.title(aid)}))}
+        dirs = ds if dirs is None else dirs & ds
+    if not dirs:
+        detail["neighbours"] = f"no folder under {film.host} contains {' and '.join(names)}"
+        return None
+    targets = [(d, fn) for d, fn in film.find(wanted) if d in dirs]
+    if not targets:
+        detail["neighbours"] = f"{wanted} not found in the {len(dirs)} folder(s) holding {' and '.join(names)}"
+        return None
+    assets = []
+    for d, fn in targets:
+        assets += im.by_path(film.container(d, fn))
+    if not assets:
+        detail["neighbours"] = f"found {len(targets)} file(s) on disk (e.g. {targets[0][1]}) but none in immich"
+        return None
+    if not args.no_ratio:
+        assets = [a for a in assets if ratio_close(flickr_size(p), asset_dims(a))] or []
+    folders = {os.path.dirname(a["originalPath"]) for a in assets}
+    if len(folders) != 1:
+        detail["neighbours"] = (f"{len(folders)} candidate folders for {wanted}: "
+                                + ", ".join(sorted(folders)[:3]))
+        return None
+    best = pick_best(assets)
+    detail["neighbours"] = f"from {' and '.join(names)}: {best['originalPath']}"
+    return best
 
 
 def process(p, im, backup, ctx, args):
@@ -341,7 +365,7 @@ def process(p, im, backup, ctx, args):
     # Neighbours are only for photos with no usable date taken. If there was a date, the time
     # search is authoritative: the photo isn't a roll-sequence scan, so don't guess from neighbours.
     if ctx is not None and items is None:
-        asset = via_neighbours(p, ctx, im, backup, args, detail)
+        asset = via_neighbours(p, ctx, im, args, detail)
         if asset:
             detail["time_from"] = "photostream neighbours"
             return finish([asset], detail, im, args)
@@ -369,6 +393,10 @@ def main():
     ap.add_argument("--max-tz-offset", type=float, default=14.0,
                     help="max camera UTC offset (hours) considered when time-searching")
     ap.add_argument("--no-ratio", action="store_true", help="don't filter on picture shape")
+    ap.add_argument("--film-root", default="/btsync/backup/Film",
+                    help="host folder holding the numbered film scans ('' disables neighbour lookup)")
+    ap.add_argument("--film-container", default="/external/older/backup/Film",
+                    help="the same folder as Immich sees it")
     ap.add_argument("--no-neighbours", dest="neighbours", action="store_false",
                     help="don't try to work out renamed film scans from neighbouring photos")
     ap.add_argument("--scan-order", choices=["asc", "desc"], default="asc",
@@ -430,7 +458,8 @@ def main():
 
     backup = (BackupById(FlickrIndex(args.flickr_root.rstrip("/") or "/", args.flickr_cache,
                                      args.reindex_flickr, logf)) if args.flickr_root else None)
-    ctx = Context(fl, args.context_cache) if args.neighbours else None
+    ctx = Context(fl, args.context_cache) if args.neighbours and args.film_root else None
+    args.film = FilmIndex(args.film_root, args.film_container, logf) if ctx else None
     im = Immich(args.url, args.api_key)
     stats = Counter()
     start, n_done = time.time(), 0

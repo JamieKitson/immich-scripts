@@ -110,10 +110,12 @@ For each tagged photo it:
 **Renamed film scans.** Only for photos with no date taken (Flickr's `datetakenunknown`, typical of
 scans; they skip the time search, since Flickr's date would just be the upload time), the script walks outwards through your photostream
 with `flickr.photos.getContext` (previous/next photo, one API call per step) to the nearest photos
-whose title is still just a number. It finds those in Immich by time and checks that their file
-names are that number. The distance gives the number for this photo: with `0010` one step before and
-`0013` two steps after, the photo is `0011`. It then looks up that name in the same folder as the
-neighbour. Whether numbers rise or fall along the stream is worked out from the two neighbours, which
+whose title is still just a number. Scans have no date, so it finds those files by number under
+`--film-root` (default `/btsync/backup/Film`; `--film-container` is the same folder as Immich sees it,
+default `/external/older/backup/Film`), walked once per run. The distance gives the number for this photo:
+with `0010` one step before and `0013` two steps after, the photo is `0011`. Both neighbours must be in
+the same folder (one roll), and the wanted file is looked up in Immich by its path there, so a number that
+exists in several rolls is only used if the folder is unambiguous. Whether numbers rise or fall along the stream is worked out from the two neighbours, which
 must agree (this also checks the stream order). `--one-sided` accepts a single neighbour, using
 `--scan-order`. The result is logged as `neighbours` in the state file. Everything fetched is cached
 in `flickr-context.json` (delete it if you reorder your photostream), so neighbouring photos in a roll
