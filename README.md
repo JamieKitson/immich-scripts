@@ -107,16 +107,19 @@ For each tagged photo it:
    with that name. Anything still tied is resolved with `--ties` (default `pick`).
 4. Favourites the asset (only with `--apply`).
 
-**Renamed film scans.** If steps 1-3 find nothing, the script looks at the photo's neighbours in your
-photostream (downloaded once, cached in `flickr-stream.json`; `flickr.photos.getContext` gives
-prev/next too, but one step per call). It walks back and forward to the nearest photos whose title
-is still just a number, finds those in Immich by time, and checks that their file names are that
-number. The distance gives the number for this photo: with `0010` one step before and `0013` two
-steps after, the photo is `0011`. It then looks up that name in the same folder as the neighbour.
-By default both neighbours must agree, which also checks that the stream order matches the scan
-order; `--one-sided` accepts a single neighbour. The result is logged as `neighbours` in the state file.
-Options: `--stream-sort` (default `date-posted-asc`, use the order the scans were uploaded in),
-`--scan-order asc|desc`, `--neighbour-steps` (default 50), `--refresh-stream`, `--no-neighbours`.
+**Renamed film scans.** If steps 1-3 find nothing, the script walks outwards through your photostream
+with `flickr.photos.getContext` (previous/next photo, one API call per step) to the nearest photos
+whose title is still just a number. It finds those in Immich by time and checks that their file
+names are that number. The distance gives the number for this photo: with `0010` one step before and
+`0013` two steps after, the photo is `0011`. It then looks up that name in the same folder as the
+neighbour. Whether numbers rise or fall along the stream is worked out from the two neighbours, which
+must agree (this also checks the stream order). `--one-sided` accepts a single neighbour, using
+`--scan-order`. The result is logged as `neighbours` in the state file. Everything fetched is cached
+in `flickr-context.json` (delete it if you reorder your photostream), so neighbouring photos in a roll
+share their walks. Other options: `--neighbour-steps` (default 50), `--no-neighbours`.
+
+(Downloading the whole photostream instead is a poor fit: `flickr.photos.search` caps each query, so
+it would need many date-range queries for a library of 70k photos.)
 
 Flickr needs an [API key](https://www.flickr.com/services/apps/create/). Without OAuth the API only
 returns public photos. For private ones, run [`flickr_auth.py`](flickr_auth.py) once (it needs

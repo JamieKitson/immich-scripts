@@ -91,83 +91,54 @@ class Flickr:
             page += 1
 
 
-class Stream:
-    """The whole photostream in a fixed order, so neighbours can be found in memory.
-    (flickr.photos.getContext also gives prev/next, but only one step per API call.)"""
+class Context:
+    """Photostream neighbours via flickr.photos.getContext (one API call per step). Everything
+    fetched is cached on disk, so neighbouring photos in one roll reuse each other's walks."""
 
-    KEEP = ("id", "title", "datetaken", "datetakengranularity", "datetakenunknown", "width_o", "height_o")
+    def __init__(self, fl, path):
+        self.fl, self.path = fl, path
+        self.d = {"ctx": {}, "titles": {}, "info": {}}
+        try:
+            with open(path) as f:
+                self.d = json.load(f)
+        except (OSError, ValueError):
+            pass
 
-    def __init__(self, photos):
-        self.photos = photos
-        self.pos = {str(p["id"]): i for i, p in enumerate(photos)}
+    def save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.d, f)
+        os.replace(tmp, self.path)
 
-    @classmethod
-    def load(cls, fl, uid, sort, cache, refresh, logf):
-        meta = {"uid": uid, "sort": sort, "oauth": fl.oauth, "v": 2}  # v2: fetched in date ranges
-        if not refresh and os.path.exists(cache):
-            try:
-                with open(cache) as f:
-                    c = json.load(f)
-                if c.get("meta") == meta:
-                    log(f"photostream loaded from {cache}: {len(c['photos'])} photos, "
-                        f"{(time.time() - c['built']) / 86400:.1f} days old (--refresh-stream to rebuild)",
-                        logf)
-                    return cls(c["photos"])
-            except Exception as e:
-                log(f"stream cache unreadable ({e}), rebuilding", logf)
-        # flickr.photos.search caps what it returns per query (your account showed exactly 1000, the
-        # docs say ~4000) and the reported total is capped too, so fetch in date ranges and split
-        # any range that comes back with 900 or more photos.
-        taken = "taken" in sort
-        epoch, lo0, hi0 = datetime(1970, 1, 1), datetime(1800, 1, 1), datetime.now() + timedelta(days=2)
-        if not taken:
-            lo0 = epoch
+    def neighbours(self, pid):
+        """{'prev': id|None, 'next': id|None} in photostream order."""
+        c = self.d["ctx"].get(pid)
+        if c is None:
+            j = self.fl.call("flickr.photos.getContext", photo_id=pid)
+            c = {}
+            for key in ("prev", "next"):
+                x = j.get(key + "photo") or {}
+                nid = str(x.get("id") or "0")
+                c[key] = None if nid == "0" else nid
+                if c[key]:
+                    self.d["titles"][nid] = x.get("title", "")
+            self.d["ctx"][pid] = c
+        return c
 
-        def bound(d):
-            return d.strftime("%Y-%m-%d %H:%M:%S") if taken else int((d - epoch).total_seconds())
+    def title(self, pid):
+        return self.d["titles"].get(pid, "")
 
-        key = "taken" if taken else "upload"
-        expected = int(fl.call("flickr.photos.search", user_id=uid, per_page=1)["photos"]["total"])
-        log(f"photostream: flickr reports {expected} photos, fetching by {key} date ranges", logf)
-        chunks = []
-
-        def fetch(lo, hi):
-            q = dict(user_id=uid, extras="date_taken,o_dims", per_page=500, sort=sort,
-                     **{f"min_{key}_date": bound(lo), f"max_{key}_date": bound(hi)})
-            first = fl.call("flickr.photos.search", page=1, **q)["photos"]
-            total = int(first["total"])
-            if total >= 900 and (hi - lo).total_seconds() > 2:
-                mid = lo + (hi - lo) / 2
-                fetch(lo, mid)
-                fetch(mid, hi)
-                return
-            photos, page, r = list(first["photo"]), 1, first
-            while page < int(r["pages"]):
-                page += 1
-                r = fl.call("flickr.photos.search", page=page, **q)["photos"]
-                photos += r["photo"]
-            chunks.append(photos)
-            log(f"  {lo:%Y-%m-%d} .. {hi:%Y-%m-%d}: {len(photos)} photos", logf)
-
-        fetch(lo0, hi0)
-        if sort.endswith("desc"):
-            chunks.reverse()   # ranges were visited oldest first
-        out, seen = [], set()
-        for ch in chunks:
-            for p in ch:
-                if p["id"] not in seen:
-                    seen.add(p["id"])
-                    out.append({k: p.get(k) for k in cls.KEEP})
-        log(f"photostream: {len(out)} photos fetched (flickr reported {expected})", logf)
-        if len(out) < expected:
-            log(f"WARNING: {expected - len(out)} photos missing (e.g. no date); neighbours near "
-                f"them may be wrong", logf)
-        with open(cache, "w") as f:
-            json.dump({"meta": meta, "built": time.time(), "photos": out}, f)
-        dates = sorted(p["datetaken"] for p in out if p.get("datetaken"))
-        if dates:
-            log(f"photostream: taken dates run {dates[0][:10]} to {dates[-1][:10]}", logf)
-        return cls(out)
+    def info(self, pid):
+        """Photo dict (id, title, date fields) for a neighbour, from flickr.photos.getInfo."""
+        i = self.d["info"].get(pid)
+        if i is None:
+            ph = self.fl.call("flickr.photos.getInfo", photo_id=pid)["photo"]
+            dt = ph.get("dates") or {}
+            i = {"id": pid, "title": self.title(pid) or (ph.get("title") or {}).get("_content", ""),
+                 "datetaken": dt.get("taken"), "datetakengranularity": dt.get("takengranularity"),
+                 "datetakenunknown": dt.get("takenunknown")}
+            self.d["info"][pid] = i
+        return i
 
 
 def numeric_title(p):
@@ -274,71 +245,75 @@ def finish(assets, detail, im, args):
     return "would_favourite", detail
 
 
-def via_neighbours(p, stream, im, backup, args, detail):
-    """Film scans whose Flickr title was changed: walk the photostream to the nearest photos whose
-    title is still just a number, find those in Immich, and work out this photo's original file
-    name from the distance. Returns an asset or None (reason in detail['neighbours'])."""
-    i = stream.pos.get(str(p["id"]))
-    if i is None:
-        detail["neighbours"] = "photo not in photostream"
-        return None
+def via_neighbours(p, ctx, im, backup, args, detail):
+    """Film scans whose Flickr title was changed: walk the photostream (getContext) to the nearest
+    photos whose title is still just a number, find those in Immich by time, and work out this
+    photo's original file name from the distance. Returns an asset or None (reason in
+    detail['neighbours'])."""
+    pid = str(p["id"])
 
-    def nearest(step):
+    def nearest(direction):
+        cur = pid
         for d in range(1, args.neighbour_steps + 1):
-            j = i + step * d
-            if not 0 <= j < len(stream.photos):
+            nid = ctx.neighbours(cur)[direction]
+            if not nid:
                 return None
-            n = numeric_title(stream.photos[j])
+            n = numeric_title({"title": ctx.title(nid)})
             if n is not None:
-                return stream.photos[j], d, n
+                return nid, d, n
+            cur = nid
         return None
 
-    sign = 1 if args.scan_order == "asc" else -1
-    before, after = nearest(-1), nearest(+1)
-    guesses = []   # (anchor flickr photo, wanted number)
-    if before:
-        guesses.append((before[0], before[2] + sign * before[1]))
-    if after:
-        guesses.append((after[0], after[2] - sign * after[1]))
-    if not guesses:
+    before, after = nearest("prev"), nearest("next")
+    if before and after:
+        up = (before[2] + before[1], after[2] - after[1])      # numbers rise along the stream
+        down = (before[2] - before[1], after[2] + after[1])    # numbers fall along the stream
+        if up[0] == up[1]:
+            wanted, order = up[0], "asc"
+        elif down[0] == down[1]:
+            wanted, order = down[0], "desc"
+        else:
+            detail["neighbours"] = (f"neighbours don't line up: {ctx.title(before[0])} (-{before[1]}) and "
+                                    f"{ctx.title(after[0])} (+{after[1]})")
+            return None
+        anchors = [before[0], after[0]]
+    elif before or after:
+        if not args.one_sided:
+            detail["neighbours"] = "only one numeric neighbour (use --one-sided to accept)"
+            return None
+        sign = 1 if args.scan_order == "asc" else -1
+        wanted = before[2] + sign * before[1] if before else after[2] - sign * after[1]
+        order, anchors = args.scan_order, [(before or after)[0]]
+    else:
         detail["neighbours"] = f"no numeric title within {args.neighbour_steps} photos either way"
         return None
-    if len(guesses) == 2 and guesses[0][1] != guesses[1][1]:
-        detail["neighbours"] = (f"neighbours disagree: {before[0]['title']} (-{before[1]}) says "
-                                f"{guesses[0][1]}, {after[0]['title']} (+{after[1]}) says {guesses[1][1]}")
-        return None
-    if len(guesses) == 1 and not args.one_sided:
-        detail["neighbours"] = "only one numeric neighbour (use --one-sided to accept)"
-        return None
-    wanted = guesses[0][1]
-    detail["wanted_number"] = wanted
-    detail["anchors"] = [q["id"] for q, _ in guesses]
+    detail.update(wanted_number=wanted, scan_order=order, anchors=anchors)
 
-    for q, _n in guesses:
+    for aid in anchors:
+        q = ctx.info(aid)
         qn = numeric_title(q)
         cands = candidates_by_time(q, im, backup, args, {}) or []
-        anchors = [a for a in cands
-                   if re.fullmatch(r"\d+", os.path.splitext(a.get("originalFileName") or "")[0])
-                   and int(os.path.splitext(a["originalFileName"])[0]) == qn]
-        if len(anchors) != 1:
-            detail["neighbours"] = f"anchor {q['title']} ({q['id']}) matched {len(anchors)} immich assets"
+        found = [a for a in cands
+                 if re.fullmatch(r"\d+", os.path.splitext(a.get("originalFileName") or "")[0])
+                 and int(os.path.splitext(a["originalFileName"])[0]) == qn]
+        if len(found) != 1:
+            detail["neighbours"] = f"anchor {q['title']} ({aid}) matched {len(found)} immich assets"
             continue
-        anchor = anchors[0]
-        stem, ext = os.path.splitext(anchor["originalFileName"])
-        path = os.path.dirname(anchor["originalPath"]) + "/" + str(wanted).zfill(len(stem)) + ext
-        found = im.by_path(path)
-        if not found:
+        stem, ext = os.path.splitext(found[0]["originalFileName"])
+        path = os.path.dirname(found[0]["originalPath"]) + "/" + str(wanted).zfill(len(stem)) + ext
+        target = im.by_path(path)
+        if not target:
             detail["neighbours"] = f"worked out {path} but it is not in immich"
             continue
-        if not args.no_ratio and not ratio_close(flickr_size(p), asset_dims(found[0])):
+        if not args.no_ratio and not ratio_close(flickr_size(p), asset_dims(target[0])):
             detail["neighbours"] = f"{path} found but its shape differs from the flickr photo"
             continue
-        detail["neighbours"] = f"from {q['title']} ({q['id']}): {path}"
-        return found[0]
+        detail["neighbours"] = f"from {q['title']} ({aid}): {path}"
+        return target[0]
     return None
 
 
-def process(p, im, backup, stream, args):
+def process(p, im, backup, ctx, args):
     """Return (status, detail). Statuses: favourited/would_favourite/already_favourite/
     not_found/ambiguous/no_date/error."""
     title = p.get("title", "")
@@ -357,8 +332,8 @@ def process(p, im, backup, stream, args):
         asset, res = resolve_tie(items, args, detail, f"{len(items)} immich assets at that time")
         return res if res else finish(asset if isinstance(asset, list) else [asset], detail, im, args)
 
-    if stream is not None:
-        asset = via_neighbours(p, stream, im, backup, args, detail)
+    if ctx is not None:
+        asset = via_neighbours(p, ctx, im, backup, args, detail)
         if asset:
             detail["time_from"] = "photostream neighbours"
             return finish([asset], detail, im, args)
@@ -388,10 +363,6 @@ def main():
     ap.add_argument("--no-ratio", action="store_true", help="don't filter on picture shape")
     ap.add_argument("--no-neighbours", dest="neighbours", action="store_false",
                     help="don't try to work out renamed film scans from neighbouring photos")
-    ap.add_argument("--stream-sort", default="date-posted-asc",
-                    choices=["date-posted-asc", "date-taken-asc", "date-posted-desc", "date-taken-desc"],
-                    help="photostream order used to find neighbours (should match the order the scans "
-                         "were uploaded in)")
     ap.add_argument("--scan-order", choices=["asc", "desc"], default="asc",
                     help="do scan numbers increase (asc) or decrease along the stream order?")
     ap.add_argument("--neighbour-steps", type=int, default=50,
@@ -399,8 +370,8 @@ def main():
     ap.add_argument("--one-sided", action="store_true",
                     help="accept a guess from a numeric neighbour on one side only (default needs both "
                          "sides to agree)")
-    ap.add_argument("--stream-cache", default="flickr-stream.json", help="cache for the photostream list")
-    ap.add_argument("--refresh-stream", action="store_true", help="re-download the photostream list")
+    ap.add_argument("--context-cache", default="flickr-context.json",
+                    help="cache of photostream neighbours (delete it if you reorder your photostream)")
     ap.add_argument("--ties", choices=["pick", "skip", "all"], default="pick",
                     help="when several assets match equally: pick one (default), skip, or favourite all")
     ap.add_argument("--flickr-root", default="/mnt/disk/flickrBackup/jamie/",
@@ -451,9 +422,7 @@ def main():
 
     backup = (BackupById(FlickrIndex(args.flickr_root.rstrip("/") or "/", args.flickr_cache,
                                      args.reindex_flickr, logf)) if args.flickr_root else None)
-    stream = None
-    if args.neighbours:
-        stream = Stream.load(fl, uid, args.stream_sort, args.stream_cache, args.refresh_stream, logf)
+    ctx = Context(fl, args.context_cache) if args.neighbours else None
     im = Immich(args.url, args.api_key)
     stats = Counter()
     start, n_done = time.time(), 0
@@ -463,7 +432,7 @@ def main():
             if pid in done:
                 continue
             try:
-                status, detail = process(p, im, backup, stream, args)
+                status, detail = process(p, im, backup, ctx, args)
             except Exception as e:
                 status, detail = "error", {"title": p.get("title"), "error": repr(e)}
             stats[status] += 1
@@ -482,6 +451,8 @@ def main():
                 log(f"[{i}/{total}] {status} {label} via {detail.get('time_from')}"
                     f"{' +name' if detail.get('name_match') else ''}", logf)
             if n_done % args.stats_every == 0:
+                if ctx:
+                    ctx.save()
                 rate = n_done / (time.time() - start)
                 remaining = total - len(done) - n_done
                 eta = timedelta(seconds=int(remaining / rate)) if rate else "?"
@@ -489,6 +460,8 @@ def main():
     except KeyboardInterrupt:
         log("interrupted - re-run the same command to resume", logf)
 
+    if ctx:
+        ctx.save()
     log(f"FINISHED this run: {dict(stats)}", logf)
     if not args.apply:
         log("dry run: nothing was written to Immich. Re-run with --apply.", logf)
