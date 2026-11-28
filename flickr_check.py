@@ -198,26 +198,45 @@ def fetch_assets(im, start, end, pad_hours):
 
 
 def load_assets(im, args, start, end):
-    """Cached asset list; refetched with --refetch or when the cached range/server differ."""
-    key = {"url": im.url, "start": start.isoformat(), "end": end.isoformat(), "pad": args.tz_pad}
+    """Cached asset list. The cache records the date range it covers; a request inside that range
+    is served from it, and a larger one only downloads the missing ends. --refetch starts over, and
+    a different server or --tz-pad discards the cache."""
+    ident = {"url": im.url, "pad": args.tz_pad}
+    have, cs, ce, built = {}, None, None, time.time()
     if not args.refetch and os.path.exists(args.immich_cache):
         try:
             with open(args.immich_cache) as f:
                 c = json.load(f)
-            if c.get("key") == key:
-                log(f"immich assets loaded from {args.immich_cache}: {len(c['assets'])} "
-                    f"({(time.time() - c['built']) / 86400:.1f} days old, --refetch to update)")
-                return c["assets"]
+            k = c.get("key", {})
+            if all(k.get(n) == v for n, v in ident.items()):
+                have = {a["id"]: a for a in c["assets"]}
+                cs, ce = datetime.fromisoformat(k["start"]), datetime.fromisoformat(k["end"])
+                built = c.get("built", built)
+            else:
+                log("immich cache is for a different server or --tz-pad, refetching")
         except Exception as e:
             log(f"immich cache unreadable ({e}), refetching")
-    log(f"downloading Immich metadata {start:%Y-%m-%d} .. {end:%Y-%m-%d} ...")
-    assets = fetch_assets(im, start, end, args.tz_pad)
+            have, cs, ce = {}, None, None
+    if cs is None:
+        gaps = [(start, end)]
+    else:
+        gaps = ([(start, cs)] if start < cs else []) + ([(ce, end)] if end > ce else [])
+    if not gaps:
+        log(f"immich assets loaded from {args.immich_cache}: {len(have)} "
+            f"({(time.time() - built) / 86400:.1f} days old, --refetch to update)")
+        return list(have.values())
+    for g0, g1 in gaps:
+        log(f"downloading Immich metadata {g0:%Y-%m-%d} .. {g1:%Y-%m-%d} ...")
+        for a in fetch_assets(im, g0, g1, args.tz_pad):
+            have[a["id"]] = a
+    lo, hi = (start, end) if cs is None else (min(start, cs), max(end, ce))
+    key = {**ident, "start": lo.isoformat(), "end": hi.isoformat()}
     tmp = args.immich_cache + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"key": key, "built": time.time(), "assets": assets}, f)
+        json.dump({"key": key, "built": time.time(), "assets": list(have.values())}, f)
     os.replace(tmp, args.immich_cache)
-    log(f"{len(assets)} assets downloaded, cached to {args.immich_cache}")
-    return assets
+    log(f"{len(have)} assets cached to {args.immich_cache} ({lo:%Y-%m-%d} .. {hi:%Y-%m-%d})")
+    return list(have.values())
 
 
 # ---------------------------------------------------------------- matching
